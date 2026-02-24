@@ -13,7 +13,7 @@ import json
 import pickle as pkl
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 
@@ -34,12 +34,29 @@ DEFAULT_VIDEO_DIR = Path(
 )
 DEFAULT_OUTPUT_DIR = Path("/data/sam3_based_labeling_pipeline/assets/videos/tests")
 
+# Camera stream index inside episode video folder -> calibration camera name.
+VIDEO_INDEX_TO_CAMERA = {
+    0: "oakd_side_view",
+    1: "oakd_wrist_view",
+}
+
+# How to interpret extrinsics for each camera stream.
+# - base_camera: static camera in base/world frame (side view)
+# - ee_camera: camera pose relative to end-effector (wrist view)
+CAMERA_EXTRINSIC_MODE = {
+    "oakd_side_view": "base_camera",
+    "oakd_wrist_view": "ee_camera",
+}
+
+# EE position correction applied before projection/chaining.
+EE_TRANSLATION_OFFSET = np.array([0.13, 0.0, 0.07], dtype=np.float64)
+
 
 @dataclass
 class Calibration:
     K: np.ndarray
     dist: np.ndarray
-    T_extrinsic: np.ndarray
+    T_ee_camera: np.ndarray
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,7 +73,13 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--calibration-dir", type=Path, default=DEFAULT_CALIBRATION_DIR)
-    parser.add_argument("--camera-name", type=str, default="oakd_side_view")
+    parser.add_argument(
+        "--camera-indices",
+        type=int,
+        nargs="+",
+        default=[0, 1],
+        help="Video stream indices to process (mapped via VIDEO_INDEX_TO_CAMERA).",
+    )
     parser.add_argument(
         "--quaternion-order",
         type=str,
@@ -84,7 +107,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_calibration(calibration_dir: Path, camera_name: str) -> Calibration:
+def load_calibration_map(calibration_dir: Path) -> Dict[str, Calibration]:
     path_intrinsics = calibration_dir / "camera_intrinsics.pkl"
     path_extrinsics = calibration_dir / "transformations.pkl"
     if not path_intrinsics.exists() or not path_extrinsics.exists():
@@ -95,27 +118,31 @@ def load_calibration(calibration_dir: Path, camera_name: str) -> Calibration:
 
     with path_intrinsics.open("rb") as f:
         intr_data = pkl.load(f)
-    if camera_name not in intr_data:
-        raise KeyError(f"Camera {camera_name!r} not found in {path_intrinsics}")
-    K, _dist_from_file = intr_data[camera_name]
-    K = np.asarray(K, dtype=np.float64)
-    # Use pure pinhole projection (no distortion adaptation/correction).
-    dist = np.zeros((5,), dtype=np.float64)
-
     with path_extrinsics.open("rb") as f:
         extr_data = pkl.load(f)
 
-    T = None
+    extr_map: Dict[str, np.ndarray] = {}
     if isinstance(extr_data, list):
         for item in extr_data:
-            if isinstance(item, (list, tuple)) and len(item) >= 2 and item[0] == camera_name:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                name = str(item[0])
                 T = np.asarray(item[1], dtype=np.float64)
-                break
-    if T is None:
-        raise KeyError(f"Camera {camera_name!r} not found in {path_extrinsics}")
-    if T.shape != (4, 4):
-        raise ValueError(f"Expected 4x4 extrinsic matrix, got {T.shape}")
-    return Calibration(K=K, dist=dist, T_extrinsic=T)
+                if T.shape == (4, 4):
+                    extr_map[name] = T
+
+    calibs: Dict[str, Calibration] = {}
+    for cam_name, intr_pair in intr_data.items():
+        if cam_name not in extr_map:
+            continue
+        K, _dist_from_file = intr_pair
+        K = np.asarray(K, dtype=np.float64)
+        # Use pure pinhole projection (no distortion adaptation/correction).
+        dist = np.zeros((5,), dtype=np.float64)
+        calibs[cam_name] = Calibration(K=K, dist=dist, T_ee_camera=extr_map[cam_name])
+
+    if not calibs:
+        raise RuntimeError(f"No valid camera calibrations loaded from {calibration_dir}")
+    return calibs
 
 
 def resolve_annotation_files(args: argparse.Namespace) -> List[Path]:
@@ -127,15 +154,14 @@ def resolve_annotation_files(args: argparse.Namespace) -> List[Path]:
     return files
 
 
-def resolve_video_path(episode_id: int, args: argparse.Namespace) -> Path:
+def resolve_video_path(episode_id: int, args: argparse.Namespace, video_index: int) -> Path:
     if args.video_path is not None:
         return args.video_path
 
     episode_dir = args.video_dir / str(episode_id)
     candidates = [
+        episode_dir / f"{video_index}_rgb.mp4",
         episode_dir / f"{episode_id}_rgb.mp4",
-        episode_dir / "0_rgb.mp4",
-        episode_dir / "1_rgb.mp4",
     ]
     for c in candidates:
         if c.exists():
@@ -144,7 +170,9 @@ def resolve_video_path(episode_id: int, args: argparse.Namespace) -> Path:
         files = sorted(episode_dir.glob(pattern))
         if files:
             return files[0]
-    raise FileNotFoundError(f"No video found for episode {episode_id} in {episode_dir}")
+    raise FileNotFoundError(
+        f"No video found for episode {episode_id} (index {video_index}) in {episode_dir}"
+    )
 
 
 def quat_to_rotmat(quat: Sequence[float], order: str) -> np.ndarray:
@@ -167,6 +195,22 @@ def quat_to_rotmat(quat: Sequence[float], order: str) -> np.ndarray:
     )
 
 
+def compute_prev_joint_pose_from_ee(
+    ee_pos: np.ndarray,
+    ee_quat: np.ndarray,
+    quaternion_order: str,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute previous-joint pose from EE pose using:
+      T_base_prev = T_base_ee @ inv(T_prev_to_ee)
+    where R_prev_to_ee = I and t_prev_to_ee = EE_TRANSLATION_OFFSET.
+    """
+    R_base_ee = quat_to_rotmat(ee_quat, order=quaternion_order)
+    p_base_ee = np.asarray(ee_pos, dtype=np.float64)
+    p_base_prev = p_base_ee - (R_base_ee @ EE_TRANSLATION_OFFSET)
+    return R_base_ee, p_base_prev
+
+
 def make_transform(R: np.ndarray, t: Sequence[float]) -> np.ndarray:
     T = np.eye(4, dtype=np.float64)
     T[:3, :3] = np.asarray(R, dtype=np.float64)
@@ -179,52 +223,12 @@ def as_homogeneous(points_xyz: np.ndarray) -> np.ndarray:
     return np.hstack([points_xyz, ones])
 
 
-def score_projection(
-    points_world: np.ndarray,
-    T_c_w: np.ndarray,
+def project_points_camera_frame(
+    points_camera: np.ndarray,
     K: np.ndarray,
     dist: np.ndarray,
-    width: int,
-    height: int,
-) -> Tuple[int, int, int]:
-    img_pts, visible, _ = project_points(points_world, K, dist, T_c_w)
-    u = img_pts[:, 0]
-    v = img_pts[:, 1]
-    in_frame = visible & (u >= 0) & (u < width) & (v >= 0) & (v < height)
-    return int(np.sum(in_frame)), int(np.sum(visible)), len(points_world)
-
-
-def choose_extrinsic_direction(
-    T_raw: np.ndarray,
-    sample_world_points: np.ndarray,
-    K: np.ndarray,
-    dist: np.ndarray,
-    width: int,
-    height: int,
-) -> Tuple[np.ndarray, str]:
-    T_inv = np.linalg.inv(T_raw)
-    raw_in, raw_vis, n = score_projection(sample_world_points, T_raw, K, dist, width, height)
-    inv_in, inv_vis, _ = score_projection(sample_world_points, T_inv, K, dist, width, height)
-    if raw_in >= inv_in:
-        return (
-            T_raw,
-            f"raw(world_to_camera assumed) in_frame={raw_in}/{n} visible={raw_vis}/{n}",
-        )
-    return (
-        T_inv,
-        f"inverse(camera_to_world provided) in_frame={inv_in}/{n} visible={inv_vis}/{n}",
-    )
-
-
-def project_points(
-    points_world: np.ndarray,
-    K: np.ndarray,
-    dist: np.ndarray,
-    T_c_w: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    points_world = np.asarray(points_world, dtype=np.float64).reshape(-1, 3)
-    pts_h = as_homogeneous(points_world)
-    pts_cam = (T_c_w @ pts_h.T).T[:, :3]
+    pts_cam = np.asarray(points_camera, dtype=np.float64).reshape(-1, 3)
     visible = pts_cam[:, 2] > 1e-6
     rvec = np.zeros((3, 1), dtype=np.float64)
     tvec = np.zeros((3, 1), dtype=np.float64)
@@ -251,6 +255,160 @@ def create_video_writer(
             print(f"[writer] codec={codec} path={out_path}")
             return writer, out_path, codec
     raise RuntimeError(f"Could not open video writer for output {preferred_path}")
+
+
+def score_ee_cam_direction(
+    ee_pos_rows: np.ndarray,
+    ee_quat_rows: np.ndarray,
+    T_ee_cam: np.ndarray,
+    K: np.ndarray,
+    dist: np.ndarray,
+    width: int,
+    height: int,
+    quaternion_order: str,
+    sample_n: int,
+) -> Tuple[int, int, int]:
+    n = min(len(ee_pos_rows), len(ee_quat_rows), sample_n)
+    in_frame = 0
+    visible = 0
+    for i in range(n):
+        R_base_prev, p_base_prev = compute_prev_joint_pose_from_ee(
+            ee_pos_rows[i], ee_quat_rows[i], quaternion_order
+        )
+        T_base_prev = make_transform(R_base_prev, p_base_prev)
+        T_base_cam = T_base_prev @ T_ee_cam
+        T_cam_base = np.linalg.inv(T_base_cam)
+        # Project the EE point itself after computing camera pose via previous joint.
+        p_ee_base = np.asarray(ee_pos_rows[i], dtype=np.float64)
+        p_prev_cam = (T_cam_base @ np.r_[p_ee_base, 1.0])[:3]
+        img_pts, vis, _ = project_points_camera_frame(
+            np.asarray([p_prev_cam], dtype=np.float64), K, dist
+        )
+        if bool(vis[0]):
+            visible += 1
+            u, v = float(img_pts[0, 0]), float(img_pts[0, 1])
+            if 0 <= u < width and 0 <= v < height:
+                in_frame += 1
+    return in_frame, visible, n
+
+
+def score_base_cam_direction(
+    ee_pos_rows: np.ndarray,
+    ee_quat_rows: np.ndarray,
+    T_base_cam: np.ndarray,
+    K: np.ndarray,
+    dist: np.ndarray,
+    width: int,
+    height: int,
+    quaternion_order: str,
+    sample_n: int,
+) -> Tuple[int, int, int]:
+    n = min(len(ee_pos_rows), sample_n)
+    T_cam_base = np.linalg.inv(T_base_cam)
+    points_base = np.asarray(ee_pos_rows[:n], dtype=np.float64)
+    points_cam = (T_cam_base @ as_homogeneous(points_base).T).T[:, :3]
+    img_pts, vis, _ = project_points_camera_frame(points_cam, K, dist)
+    in_frame = int(
+        np.sum(
+            vis
+            & (img_pts[:, 0] >= 0)
+            & (img_pts[:, 0] < width)
+            & (img_pts[:, 1] >= 0)
+            & (img_pts[:, 1] < height)
+        )
+    )
+    visible = int(np.sum(vis))
+    return in_frame, visible, n
+
+
+def choose_base_cam_direction(
+    ee_pos_rows: np.ndarray,
+    ee_quat_rows: np.ndarray,
+    T_base_cam_raw: np.ndarray,
+    K: np.ndarray,
+    dist: np.ndarray,
+    width: int,
+    height: int,
+    quaternion_order: str,
+    sample_n: int,
+) -> Tuple[np.ndarray, str]:
+    raw_in, raw_vis, n = score_base_cam_direction(
+        ee_pos_rows,
+        ee_quat_rows,
+        T_base_cam_raw,
+        K,
+        dist,
+        width,
+        height,
+        quaternion_order,
+        sample_n,
+    )
+    inv_T = np.linalg.inv(T_base_cam_raw)
+    inv_in, inv_vis, _ = score_base_cam_direction(
+        ee_pos_rows,
+        ee_quat_rows,
+        inv_T,
+        K,
+        dist,
+        width,
+        height,
+        quaternion_order,
+        sample_n,
+    )
+    if raw_in > inv_in or (raw_in == inv_in and raw_vis >= inv_vis):
+        return (
+            T_base_cam_raw,
+            f"raw(T_base_camera) in_frame={raw_in}/{n} visible={raw_vis}/{n}",
+        )
+    return (
+        inv_T,
+        f"inverse(T_base_camera) in_frame={inv_in}/{n} visible={inv_vis}/{n}",
+    )
+
+
+def choose_ee_cam_direction(
+    ee_pos_rows: np.ndarray,
+    ee_quat_rows: np.ndarray,
+    T_ee_cam_raw: np.ndarray,
+    K: np.ndarray,
+    dist: np.ndarray,
+    width: int,
+    height: int,
+    quaternion_order: str,
+    sample_n: int,
+) -> Tuple[np.ndarray, str]:
+    raw_in, raw_vis, n = score_ee_cam_direction(
+        ee_pos_rows,
+        ee_quat_rows,
+        T_ee_cam_raw,
+        K,
+        dist,
+        width,
+        height,
+        quaternion_order,
+        sample_n,
+    )
+    inv_T = np.linalg.inv(T_ee_cam_raw)
+    inv_in, inv_vis, _ = score_ee_cam_direction(
+        ee_pos_rows,
+        ee_quat_rows,
+        inv_T,
+        K,
+        dist,
+        width,
+        height,
+        quaternion_order,
+        sample_n,
+    )
+    if raw_in > inv_in or (raw_in == inv_in and raw_vis >= inv_vis):
+        return (
+            T_ee_cam_raw,
+            f"raw(T_ee_camera) in_frame={raw_in}/{n} visible={raw_vis}/{n}",
+        )
+    return (
+        inv_T,
+        f"inverse(T_ee_camera) in_frame={inv_in}/{n} visible={inv_vis}/{n}",
+    )
 
 
 def draw_overlay(frame: np.ndarray, ee_pixel: np.ndarray | None) -> np.ndarray:
@@ -295,11 +453,13 @@ def read_annotation(annotation_path: Path) -> dict:
     return data
 
 
-def process_episode(
+def process_episode_camera(
     annotation_path: Path,
     video_path: Path,
     output_dir: Path,
     calib: Calibration,
+    camera_name: str,
+    video_index: int,
     args: argparse.Namespace,
 ) -> None:
     data = read_annotation(annotation_path)
@@ -329,56 +489,44 @@ def process_episode(
         cap.release()
         raise ValueError(f"No overlapping frames between states and video for episode {episode_id}")
 
-    n_diag = min(max(1, args.diagnostic_first_n), n) if args.diagnostic_first_n > 0 else min(10, n)
-    sample_points = ee_pos_rows[:n_diag]
-    T_c_w, extr_mode = choose_extrinsic_direction(
-        calib.T_extrinsic, sample_points, calib.K, calib.dist, width, height
-    )
-
-    # Optional XY-swap diagnostic: some logs/tools accidentally interpret pixel order as (v, u).
-    # We evaluate both interpretations and keep swapped only if explicitly enabled and better.
-    sample_img, sample_vis, _ = project_points(sample_points, calib.K, calib.dist, T_c_w)
-    normal_in = int(
-        np.sum(
-            sample_vis
-            & (sample_img[:, 0] >= 0)
-            & (sample_img[:, 0] < width)
-            & (sample_img[:, 1] >= 0)
-            & (sample_img[:, 1] < height)
+    camera_mode = CAMERA_EXTRINSIC_MODE.get(camera_name, "ee_camera")
+    sample_n = args.diagnostic_first_n if args.diagnostic_first_n > 0 else 20
+    direction_mode = ""
+    T_ee_cam = None
+    T_cam_base_static = None
+    if camera_mode == "base_camera":
+        T_base_cam, direction_mode = choose_base_cam_direction(
+            ee_pos_rows=ee_pos_rows,
+            ee_quat_rows=ee_quat_rows,
+            T_base_cam_raw=calib.T_ee_camera,
+            K=calib.K,
+            dist=calib.dist,
+            width=width,
+            height=height,
+            quaternion_order=args.quaternion_order,
+            sample_n=sample_n,
         )
-    )
-    swapped_in = int(
-        np.sum(
-            sample_vis
-            & (sample_img[:, 1] >= 0)
-            & (sample_img[:, 1] < width)
-            & (sample_img[:, 0] >= 0)
-            & (sample_img[:, 0] < height)
+        T_cam_base_static = np.linalg.inv(T_base_cam)
+        print(f"[episode {episode_id} cam={camera_name}] base_cam_direction: {direction_mode}")
+    else:
+        # Extrinsics are relative to EE pose. Chain per frame: T_base_cam = T_base_ee @ T_ee_cam.
+        T_ee_cam, direction_mode = choose_ee_cam_direction(
+            ee_pos_rows=ee_pos_rows,
+            ee_quat_rows=ee_quat_rows,
+            T_ee_cam_raw=calib.T_ee_camera,
+            K=calib.K,
+            dist=calib.dist,
+            width=width,
+            height=height,
+            quaternion_order=args.quaternion_order,
+            sample_n=sample_n,
         )
-    )
-    use_swapped_xy = bool(args.auto_swap_xy and swapped_in > normal_in)
-
-    if args.diagnostic_first_n > 0:
-        print(f"[diagnostic] extrinsic_choice: {extr_mode}")
-        print(
-            f"[diagnostic] pixel_order normal_in_frame={normal_in}/{n_diag} "
-            f"swapped_in_frame={swapped_in}/{n_diag} use_swapped_xy={use_swapped_xy}"
-        )
-        for i in range(n_diag):
-            u = float(sample_img[i, 0])
-            v = float(sample_img[i, 1])
-            z = float((T_c_w @ np.r_[sample_points[i], 1.0])[:3][2])
-            normal_ok = bool(sample_vis[i] and (0 <= u < width) and (0 <= v < height))
-            swapped_ok = bool(sample_vis[i] and (0 <= v < width) and (0 <= u < height))
-            print(
-                f"[diagnostic frame {i}] uv=({u:.1f},{v:.1f}) z={z:.4f} "
-                f"normal_in={normal_ok} swapped_in={swapped_ok}"
-            )
+        print(f"[episode {episode_id} cam={camera_name}] ee_cam_direction: {direction_mode}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    out_overlay_pref = output_dir / f"episode_{episode_id}_overlay.mp4"
-    out_meta_path = output_dir / f"episode_{episode_id}_meta.json"
-    out_pixels_path = output_dir / f"episode_{episode_id}_ee_pixels.npy"
+    out_overlay_pref = output_dir / f"episode_{episode_id}_{camera_name}_overlay.mp4"
+    out_meta_path = output_dir / f"episode_{episode_id}_{camera_name}_meta.json"
+    out_pixels_path = output_dir / f"episode_{episode_id}_{camera_name}_ee_pixels.npy"
 
     writer, out_overlay_path, writer_codec = create_video_writer(
         preferred_path=out_overlay_pref, width=width, height=height, fps=fps
@@ -393,15 +541,24 @@ def process_episode(
         if not ok or frame is None:
             break
 
-        # We keep orientation parsing for future axes/pose overlays, even though this
-        # EE-only mode currently visualizes just the projected EE position.
-        _ = quat_to_rotmat(ee_quat_rows[i], order=args.quaternion_order)
-        img_pts, vis, pts_cam = project_points(
-            np.asarray([ee_pos_rows[i]], dtype=np.float64), calib.K, calib.dist, T_c_w
+        R_base_prev, p_base_prev = compute_prev_joint_pose_from_ee(
+            ee_pos_rows[i], ee_quat_rows[i], args.quaternion_order
+        )
+        if camera_mode == "base_camera":
+            # Side camera: static transform between base and camera.
+            p_ee_base = np.asarray(ee_pos_rows[i], dtype=np.float64)
+            p_ee_cam = (T_cam_base_static @ np.r_[p_ee_base, 1.0])[:3]
+        else:
+            # Wrist camera: transform depends on current EE pose.
+            T_base_prev = make_transform(R_base_prev, p_base_prev)
+            T_base_cam = T_base_prev @ T_ee_cam
+            T_cam_base = np.linalg.inv(T_base_cam)
+            p_ee_base = np.asarray(ee_pos_rows[i], dtype=np.float64)
+            p_ee_cam = (T_cam_base @ np.r_[p_ee_base, 1.0])[:3]
+        img_pts, vis, pts_cam = project_points_camera_frame(
+            np.asarray([p_ee_cam], dtype=np.float64), calib.K, calib.dist
         )
         ee_px = img_pts[0]
-        if use_swapped_xy:
-            ee_px = np.array([ee_px[1], ee_px[0]], dtype=np.float64)
         is_visible = bool(vis[0])
         z = float(pts_cam[0, 2])
         is_in_frame = is_visible and (0 <= ee_px[0] < width and 0 <= ee_px[1] < height)
@@ -413,7 +570,7 @@ def process_episode(
 
         if args.debug_print_pixels:
             print(
-                f"[episode {episode_id} frame {i}] "
+                f"[episode {episode_id} cam={camera_name} idx={video_index} frame {i}] "
                 f"ee_px=({ee_px[0]:.1f},{ee_px[1]:.1f}) z={z:.4f} "
                 f"visible={is_visible} in_frame={is_in_frame}"
             )
@@ -434,9 +591,15 @@ def process_episode(
         "episode_id": episode_id,
         "annotation_path": str(annotation_path),
         "video_path": str(video_path),
-        "camera_name": args.camera_name,
-        "extrinsic_mode": extr_mode,
-        "use_swapped_xy": use_swapped_xy,
+        "camera_name": camera_name,
+        "video_index": video_index,
+        "camera_extrinsic_mode": camera_mode,
+        "transform_chain": (
+            "T_base_cam static (base_camera mode)"
+            if camera_mode == "base_camera"
+            else "T_base_cam = T_base_prevJoint @ T_prevJoint_camera"
+        ),
+        "extrinsic_direction": direction_mode,
         "writer_codec": writer_codec,
         "overlay_path": str(out_overlay_path),
         "ee_pixels_path": str(out_pixels_path),
@@ -448,10 +611,10 @@ def process_episode(
     with out_meta_path.open("w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
-    print(f"[episode {episode_id}] processed_frames={n}")
-    print(f"[episode {episode_id}] in_frame_visible_frames={in_frame_count}")
-    print(f"[episode {episode_id}] saved overlay: {out_overlay_path}")
-    print(f"[episode {episode_id}] saved ee pixels: {out_pixels_path}")
+    print(f"[episode {episode_id} cam={camera_name}] processed_frames={n}")
+    print(f"[episode {episode_id} cam={camera_name}] in_frame_visible_frames={in_frame_count}")
+    print(f"[episode {episode_id} cam={camera_name}] saved overlay: {out_overlay_path}")
+    print(f"[episode {episode_id} cam={camera_name}] saved ee pixels: {out_pixels_path}")
 
 
 def main() -> None:
@@ -462,18 +625,28 @@ def main() -> None:
         )
     args = parse_args()
     annotation_files = resolve_annotation_files(args)
-    calib = load_calibration(args.calibration_dir, args.camera_name)
+    calibration_map = load_calibration_map(args.calibration_dir)
 
     for annotation_path in annotation_files:
         episode_id = int(read_annotation(annotation_path)["episode_id"])
-        video_path = resolve_video_path(episode_id, args)
-        process_episode(
-            annotation_path=annotation_path,
-            video_path=video_path,
-            output_dir=args.output_dir,
-            calib=calib,
-            args=args,
-        )
+        for video_index in args.camera_indices:
+            if video_index not in VIDEO_INDEX_TO_CAMERA:
+                print(f"[episode {episode_id}] skipping unknown video index {video_index}")
+                continue
+            camera_name = VIDEO_INDEX_TO_CAMERA[video_index]
+            if camera_name not in calibration_map:
+                print(f"[episode {episode_id}] calibration missing for camera {camera_name}")
+                continue
+            video_path = resolve_video_path(episode_id, args, video_index=video_index)
+            process_episode_camera(
+                annotation_path=annotation_path,
+                video_path=video_path,
+                output_dir=args.output_dir,
+                calib=calibration_map[camera_name],
+                camera_name=camera_name,
+                video_index=video_index,
+                args=args,
+            )
 
 
 if __name__ == "__main__":
