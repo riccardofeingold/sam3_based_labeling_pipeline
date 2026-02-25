@@ -152,3 +152,5 @@ Thumbs.db
 *.bpe
 *.vocab
 .history/*
+
+test_le_robot_dataset/
