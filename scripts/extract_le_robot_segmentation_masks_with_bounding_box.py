@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import json
 import tempfile
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
@@ -22,25 +21,22 @@ from sam3.model_builder import build_sam3_video_predictor
 
 
 DEFAULT_DATASET_ROOT = Path(
-    # "/data/sam3_based_labeling_pipeline/assets/test_le_robot_dataset"
+    "/data/sam3_based_labeling_pipeline/assets/test_le_robot_dataset"
     # "/data/Ctrl-World/datasets/red_cube_not_on_red_ramp_real"
-    "/data/Ctrl-World/datasets/large_real_dataset"
 )
 DEFAULT_CALIBRATION_DIR = Path(
     "/data/sam3_based_labeling_pipeline/assets/calibration_params"
 )
 
-# View index -> prompt list.
-# `obj_id` is sent to SAM3 as the prompt object id.
-# `label_id` is written into the final segmentation mask.
+# View index -> prompt list. obj_id maps directly to mask label id.
 VIEW_PROMPTS = {
     0: [
-        {"obj_id": 0, "label_id": 1, "text": "the hand"},
-        {"obj_id": 1, "label_id": 2, "text": "red dice"},
+        {"obj_id": 0, "text": "the hand"},
+        {"obj_id": 1, "text": "red dice"},
     ],
     1: [
-        {"obj_id": 0, "label_id": 1, "text": "robot hand on the left"},
-        {"obj_id": 1, "label_id": 2, "text": "red dice"},
+        {"obj_id": 0, "text": "the hand"},
+        {"obj_id": 1, "text": "red dice"},
     ],
 }
 
@@ -102,16 +98,6 @@ def parse_args() -> argparse.Namespace:
         help="Optional episode ids to process. Defaults to all annotation files.",
     )
     parser.add_argument(
-        "--rotate-view1-episode-ids",
-        type=str,
-        nargs="+",
-        default=None,
-        help=(
-            "Optional episode ids for which videos/<episode>/1_rgb.mp4 is rotated by 180 "
-            "degrees in-place before SAM3 processing. Supports ranges like '1-10'."
-        ),
-    )
-    parser.add_argument(
         "--max-frames",
         type=int,
         default=None,
@@ -139,7 +125,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--debug-projection-images",
         type=int,
-        default=0,
+        default=6,
         help="Number of sampled debug images to save per processed video (0 to disable).",
     )
     parser.add_argument(
@@ -212,27 +198,6 @@ def parse_args() -> argparse.Namespace:
         help="Optional wrist override: positive secondary projected-axis extent (meters).",
     )
     return parser.parse_args()
-
-
-def _parse_episode_id_tokens(tokens: List[str] | None) -> set[int]:
-    if tokens is None:
-        return set()
-    out: set[int] = set()
-    for token in tokens:
-        tok = token.strip()
-        if not tok:
-            continue
-        if "-" in tok:
-            start_s, end_s = tok.split("-", 1)
-            if not start_s or not end_s:
-                raise ValueError(f"Invalid episode id range token: {token!r}")
-            start = int(start_s)
-            end = int(end_s)
-            lo, hi = (start, end) if start <= end else (end, start)
-            out.update(range(lo, hi + 1))
-        else:
-            out.add(int(tok))
-    return out
 
 
 def _to_binary_mask(mask: np.ndarray | torch.Tensor) -> np.ndarray:
@@ -712,45 +677,6 @@ def _create_video_writer(path: Path, width: int, height: int, fps: float) -> cv2
     raise RuntimeError(f"Could not open video writer for output: {path}")
 
 
-def rotate_video_180_inplace(video_path: Path, target_fps: float | None = None) -> None:
-    assert cv2 is not None
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video for rotation: {video_path}")
-
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    source_fps = float(cap.get(cv2.CAP_PROP_FPS))
-    fps = float(target_fps) if target_fps is not None and target_fps > 0 else source_fps
-    if fps <= 0:
-        fps = 30.0
-
-    temp_path = video_path.with_name(
-        f"{video_path.stem}.rot180.{uuid.uuid4().hex[:8]}{video_path.suffix}"
-    )
-    writer = cv2.VideoWriter(
-        str(temp_path),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps,
-        (width, height),
-    )
-    if not writer.isOpened():
-        cap.release()
-        raise RuntimeError(f"Could not create temporary rotated video: {temp_path}")
-
-    try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            writer.write(cv2.rotate(frame, cv2.ROTATE_180))
-    finally:
-        cap.release()
-        writer.release()
-
-    temp_path.replace(video_path)
-
-
 def discover_episode_ids(annotation_dir: Path) -> List[int]:
     annotation_files = sorted(annotation_dir.glob("*.json"))
     if not annotation_files:
@@ -771,14 +697,10 @@ def discover_episode_ids(annotation_dir: Path) -> List[int]:
 def _run_propagation_for_prompt(
     predictor,
     session_id: str,
-    mask_label_id: int,
+    obj_id: int,
     max_frame_num_to_track: int,
     ee_target_pix_by_frame: Dict[int, np.ndarray] | None = None,
-    start_frame_index: int | None = 0,
-    propagation_direction: str = "both",
 ) -> Dict[int, Dict[str, np.ndarray]]:
-    ee_candidate_radius_px = 5.0
-
     def _min_sq_dist_mask_to_point(mask_arr: np.ndarray, point_xy: np.ndarray) -> float:
         mask_bool = _to_binary_mask(mask_arr)
         ys, xs = np.nonzero(mask_bool)
@@ -794,8 +716,7 @@ def _run_propagation_for_prompt(
         request=dict(
             type="propagate_in_video",
             session_id=session_id,
-            propagation_direction=propagation_direction,
-            start_frame_index=start_frame_index,
+            start_frame_index=0,
             max_frame_num_to_track=max_frame_num_to_track,
         )
     ):
@@ -813,21 +734,14 @@ def _run_propagation_for_prompt(
             else None
         )
         if target_pix is not None:
-            min_sq_dists = np.asarray(
-                [_min_sq_dist_mask_to_point(mask, target_pix) for mask in masks],
-                dtype=np.float64,
+            best_idx = min(
+                range(len(masks)),
+                key=lambda i: _min_sq_dist_mask_to_point(masks[i], target_pix),
             )
-            in_range = min_sq_dists <= (ee_candidate_radius_px * ee_candidate_radius_px)
-            if bool(np.any(in_range)):
-                candidate_indices = np.nonzero(in_range)[0]
-                best_local = int(np.argmax(scores[candidate_indices]))
-                best_idx = int(candidate_indices[best_local])
-            else:
-                best_idx = int(np.argmax(scores))
         else:
             best_idx = int(np.argmax(scores))
         frame_store = outputs_per_frame.setdefault(frame_idx, {})
-        frame_store[mask_label_id] = np.asarray(masks[best_idx])
+        frame_store[obj_id] = np.asarray(masks[best_idx])
 
     return outputs_per_frame
 
@@ -884,7 +798,6 @@ def _render_segmentation_frame(label_map: np.ndarray) -> np.ndarray:
 def process_video(
     predictor,
     episode_id: int,
-    view_index: int,
     video_path: Path,
     output_video_path: Path,
     output_mask_path: Path,
@@ -907,9 +820,7 @@ def process_video(
     max_frames: int | None,
 ) -> None:
     info = _open_video_info(video_path)
-    # Always track the full length of each video for both views.
-    # (Keep `max_frames` in signature for compatibility with existing call sites.)
-    max_frame_num_to_track = info.frame_count
+    max_frame_num_to_track = min(max_frames, info.frame_count) if max_frames else info.frame_count
     if cv2 is None:
         raise ModuleNotFoundError(
             "OpenCV is required. Install it with: pip install opencv-python"
@@ -1007,15 +918,8 @@ def process_video(
     merged_outputs: Dict[int, Dict[int, np.ndarray]] = {}
     try:
         for prompt_spec in prompts:
-            prompt_obj_id = int(prompt_spec["obj_id"])
-            mask_label_id = int(prompt_spec.get("label_id", prompt_obj_id))
+            obj_id = int(prompt_spec["obj_id"])
             text = str(prompt_spec["text"])
-            if mask_label_id == 0:
-                raise ValueError(
-                    "label_id=0 is reserved for background in this script. "
-                    "Use non-zero label_id (for example 1 for hand, 2 for cube) "
-                    "while keeping prompt obj_id as 0/1 if desired."
-                )
 
             _ = predictor.handle_request(
                 request=dict(type="reset_session", session_id=session_id)
@@ -1025,24 +929,18 @@ def process_video(
                     type="add_prompt",
                     session_id=session_id,
                     frame_index=0,
-                    obj_id=prompt_obj_id,
+                    obj_id=obj_id,
                     text=text,
                 )
             )
 
-            propagation_direction = "both"
-            start_frame_index = 0
             prompt_outputs = _run_propagation_for_prompt(
                 predictor=predictor,
                 session_id=session_id,
-                mask_label_id=mask_label_id,
+                obj_id=obj_id,
                 max_frame_num_to_track=max_frame_num_to_track,
-                start_frame_index=start_frame_index,
-                propagation_direction=propagation_direction,
                 ee_target_pix_by_frame=(
-                    ee_target_pix_by_frame
-                    if (view_index == 0 and prompt_obj_id == 0)
-                    else None
+                    ee_target_pix_by_frame if obj_id == hand_label_id else None
                 ),
             )
             _merge_outputs(merged_outputs, prompt_outputs)
@@ -1080,6 +978,10 @@ def process_video(
         height=info.height,
         fps=output_fps if output_fps > 0 else info.fps,
     )
+    roi_neg_primary_m = max(0.0, float(roi_neg_primary_m))
+    roi_pos_primary_m = max(0.0, float(roi_pos_primary_m))
+    roi_neg_secondary_m = max(0.0, float(roi_neg_secondary_m))
+    roi_pos_secondary_m = max(0.0, float(roi_pos_secondary_m))
     filtered_label_maps = np.zeros_like(label_maps)
     try:
         for frame_idx in range(max_frame_num_to_track):
@@ -1096,23 +998,63 @@ def process_video(
                     T_ee_cam=T_ee_cam,
                     T_cam_base_static=T_cam_base_static,
                 )
+                roi_poly_pix, roi_poly_vis, _chosen_axes = project_ee_axis_aligned_roi_polygon(
+                    ee_pos=ee_pos_rows[frame_idx],
+                    ee_quat=ee_quat_rows[frame_idx],
+                    calib=calib,
+                    camera_mode=camera_mode,
+                    quaternion_order=quaternion_order,
+                    T_ee_cam=T_ee_cam,
+                    T_cam_base_static=T_cam_base_static,
+                    ee_pix=ee_pix,
+                    axis_pix=axis_pix,
+                    vis=vis,
+                    neg_primary_m=roi_neg_primary_m,
+                    pos_primary_m=roi_pos_primary_m,
+                    neg_secondary_m=roi_neg_secondary_m,
+                    pos_secondary_m=roi_pos_secondary_m,
+                )
+                if bool(np.all(roi_poly_vis)):
+                    roi_mask = rasterize_hull_mask(
+                        width=info.width,
+                        height=info.height,
+                        points_xy=roi_poly_pix,
+                    )
+                    if box_soft_margin_px > 0:
+                        kernel_radius = int(box_soft_margin_px)
+                        kernel_size = kernel_radius * 2 + 1
+                        kernel = cv2.getStructuringElement(
+                            cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+                        )
+                        roi_mask_uint8 = roi_mask.astype(np.uint8)
+                        roi_mask = cv2.dilate(roi_mask_uint8, kernel, iterations=1) > 0
+                    hand_mask = frame_label_map == np.uint8(hand_label_id)
+                    frame_label_map[hand_mask & (~roi_mask)] = np.uint8(0)
+                filtered_label_maps[frame_idx] = frame_label_map
+
                 if frame_idx in debug_indices:
                     orig_overlay = draw_ee_overlay(
                         frame_rgb=original_frames[frame_idx],
                         ee_pix=ee_pix,
                         axis_pix=axis_pix,
                         vis=vis,
+                        roi_polygon=roi_poly_pix,
+                        roi_polygon_vis=roi_poly_vis,
                     )
                     seg_overlay = draw_ee_overlay(
                         frame_rgb=_render_segmentation_frame(frame_label_map),
                         ee_pix=ee_pix,
                         axis_pix=axis_pix,
                         vis=vis,
+                        roi_polygon=roi_poly_pix,
+                        roi_polygon_vis=roi_poly_vis,
                     )
                     side_by_side = np.concatenate([orig_overlay, seg_overlay], axis=1)
                     debug_path = debug_dir / f"frame_{frame_idx:06d}.png"
                     Image.fromarray(side_by_side).save(debug_path)
-            filtered_label_maps[frame_idx] = frame_label_map
+            else:
+                filtered_label_maps[frame_idx] = frame_label_map
+
             frame_rgb = _render_segmentation_frame(frame_label_map)
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
             writer.write(frame_bgr)
@@ -1166,7 +1108,6 @@ def main() -> None:
         episode_ids = discover_episode_ids(annotation_dir=annotation_dir)
     else:
         episode_ids = sorted(set(int(x) for x in args.episode_ids))
-    rotate_view1_episode_ids = _parse_episode_id_tokens(args.rotate_view1_episode_ids)
 
     calibration_map = load_calibration_map(args.calibration_dir)
     predictor = build_sam3_video_predictor()
@@ -1194,14 +1135,6 @@ def main() -> None:
                 if not input_video_path.exists():
                     print(f"[warning] Missing input video: {input_video_path}")
                     continue
-                if view_index == 1 and (
-                    requested_episode_id in rotate_view1_episode_ids
-                    or episode_id in rotate_view1_episode_ids
-                ):
-                    print(
-                        f"[episode {episode_id}] rotating {input_video_path.name} by 180 degrees"
-                    )
-                    rotate_video_180_inplace(input_video_path, target_fps=args.output_fps)
 
                 output_video_path = episode_dir / f"{view_index}_segmentation.mp4"
                 output_mask_path = episode_dir / f"{view_index}_segmentation_mask.npy"
@@ -1236,7 +1169,6 @@ def main() -> None:
                 process_video(
                     predictor=predictor,
                     episode_id=episode_id,
-                    view_index=view_index,
                     video_path=input_video_path,
                     output_video_path=output_video_path,
                     output_mask_path=output_mask_path,
