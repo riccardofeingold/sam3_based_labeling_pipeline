@@ -29,6 +29,12 @@ DEFAULT_DATASET_ROOT = Path(
 DEFAULT_CALIBRATION_DIR = Path(
     "/data/sam3_based_labeling_pipeline/assets/calibration_params"
 )
+DEFAULT_WRIST_PRIMING_VIDEO_PATH = Path(
+    "/data/Ctrl-World/datasets/initial_hand_motion/videos/6/1_rgb.mp4"
+)
+WRIST_CLICK_POINT_XY = (270, 20)
+WRIST_VIEW_INDEX = 1
+THIRD_VIEW_INDEX = 2
 
 # View index -> prompt list.
 # `obj_id` is sent to SAM3 as the prompt object id.
@@ -39,7 +45,7 @@ VIEW_PROMPTS = {
         {"obj_id": 1, "label_id": 2, "text": "red dice"},
     ],
     1: [
-        {"obj_id": 0, "label_id": 1, "text": "robot hand on the left"},
+        {"obj_id": 0, "label_id": 1, "text": "robotic hand"},
         {"obj_id": 1, "label_id": 2, "text": "red dice"},
     ],
 }
@@ -112,10 +118,58 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--recompute-wrist-episode-ids",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "Episode ids/ranges to recompute only wrist view (view=1). "
+            "Example: --recompute-wrist-episode-ids 10-20 24"
+        ),
+    )
+    parser.add_argument(
+        "--recompute-third-episode-ids",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "Episode ids/ranges to recompute only third view (view=2). "
+            "Example: --recompute-third-episode-ids 30-40"
+        ),
+    )
+    parser.add_argument(
+        "--recompute-both-episode-ids",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "Episode ids/ranges to recompute both wrist (view=1) and third (view=2). "
+            "Example: --recompute-both-episode-ids 50-60"
+        ),
+    )
+    parser.add_argument(
         "--max-frames",
         type=int,
         default=None,
         help="Optional maximum frames to track per video.",
+    )
+    parser.add_argument(
+        "--chunk-max-frames",
+        type=int,
+        default=500,
+        help=(
+            "Maximum number of target frames to process per SAM3 chunk. "
+            "Use <= 0 to disable chunking and process all frames in one pass."
+        ),
+    )
+    parser.add_argument(
+        "--downscaled-long-side-px",
+        type=int,
+        default=1008, # best results with this value
+        help=(
+            "Optional maximum pixel size for the larger side of preprocessed frames fed to SAM3. "
+            "Frames are resized with preserved aspect ratio only when their larger side exceeds this value."
+        ),
     )
     parser.add_argument(
         "--output-fps",
@@ -128,6 +182,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_CALIBRATION_DIR,
         help="Directory containing camera_intrinsics.pkl and transformations.pkl.",
+    )
+    parser.add_argument(
+        "--wrist-priming-video-path",
+        type=Path,
+        default=DEFAULT_WRIST_PRIMING_VIDEO_PATH,
+        help="Priming video used for wrist-view SAM3 warm-up.",
     )
     parser.add_argument(
         "--quaternion-order",
@@ -244,6 +304,35 @@ def _to_binary_mask(mask: np.ndarray | torch.Tensor) -> np.ndarray:
     return mask_arr > 0.0
 
 
+def _episode_matches(ids: set[int], requested_episode_id: int, annotation_episode_id: int) -> bool:
+    return requested_episode_id in ids or annotation_episode_id in ids
+
+
+def _views_to_recompute_for_episode(
+    requested_episode_id: int,
+    annotation_episode_id: int,
+    recompute_wrist_episode_ids: set[int],
+    recompute_third_episode_ids: set[int],
+    recompute_both_episode_ids: set[int],
+) -> tuple[set[int], bool]:
+    recompute_mode = bool(
+        recompute_wrist_episode_ids
+        or recompute_third_episode_ids
+        or recompute_both_episode_ids
+    )
+    if not recompute_mode:
+        return set(VIEW_PROMPTS.keys()), False
+
+    selected_views: set[int] = set()
+    if _episode_matches(recompute_both_episode_ids, requested_episode_id, annotation_episode_id):
+        selected_views.update({WRIST_VIEW_INDEX, THIRD_VIEW_INDEX})
+    if _episode_matches(recompute_wrist_episode_ids, requested_episode_id, annotation_episode_id):
+        selected_views.add(WRIST_VIEW_INDEX)
+    if _episode_matches(recompute_third_episode_ids, requested_episode_id, annotation_episode_id):
+        selected_views.add(THIRD_VIEW_INDEX)
+    return selected_views, True
+
+
 def _ensure_rgb_uint8(frame: np.ndarray) -> np.ndarray:
     arr = np.asarray(frame)
     if arr.dtype != np.uint8:
@@ -259,21 +348,51 @@ def _ensure_rgb_uint8(frame: np.ndarray) -> np.ndarray:
     raise ValueError(f"Unsupported channel count: {arr.shape[2]}")
 
 
-def _resize_longest_side(frame: np.ndarray, target_longest: int = 1008) -> np.ndarray:
-    frame_rgb = _ensure_rgb_uint8(frame)
-    h, w = frame_rgb.shape[:2]
-    longest = max(h, w)
-    if longest == target_longest:
-        return frame_rgb
-    scale = float(target_longest) / float(longest)
-    new_w = max(1, int(round(w * scale)))
-    new_h = max(1, int(round(h * scale)))
-    if cv2 is None:
-        raise ModuleNotFoundError(
-            "OpenCV is required. Install it with: pip install opencv-python"
+def _resize_frames_to_shape(
+    frames: Iterable[np.ndarray], target_height: int, target_width: int
+) -> List[np.ndarray]:
+    resized: List[np.ndarray] = []
+    for frame in frames:
+        frame_rgb = _ensure_rgb_uint8(frame)
+        if frame_rgb.shape[:2] == (target_height, target_width):
+            resized.append(frame_rgb)
+            continue
+        pil_frame = Image.fromarray(frame_rgb)
+        pil_frame = pil_frame.resize((target_width, target_height), resample=Image.BILINEAR)
+        resized.append(_ensure_rgb_uint8(np.asarray(pil_frame)))
+    return resized
+
+
+def _compute_scaled_shape(
+    height: int, width: int, downscaled_long_side_px: int | None
+) -> Tuple[int, int]:
+    if downscaled_long_side_px is None:
+        return height, width
+    if downscaled_long_side_px <= 0:
+        raise ValueError(
+            f"Expected --downscaled-long-side-px to be positive, got {downscaled_long_side_px}"
         )
-    resized = cv2.resize(frame_rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    return _ensure_rgb_uint8(resized)
+    long_side = max(height, width)
+    if long_side <= downscaled_long_side_px:
+        return height, width
+    scale = float(downscaled_long_side_px) / float(long_side)
+    scaled_h = max(1, int(round(float(height) * scale)))
+    scaled_w = max(1, int(round(float(width) * scale)))
+    return scaled_h, scaled_w
+
+
+def _iter_chunk_bounds(total_frames: int, chunk_max_frames: int) -> List[Tuple[int, int]]:
+    if total_frames <= 0:
+        return []
+    if chunk_max_frames <= 0:
+        return [(0, total_frames)]
+    bounds: List[Tuple[int, int]] = []
+    start = 0
+    while start < total_frames:
+        end = min(total_frames, start + chunk_max_frames)
+        bounds.append((start, end))
+        start = end
+    return bounds
 
 
 def _open_video_info(video_path: Path) -> VideoInfo:
@@ -712,6 +831,22 @@ def _create_video_writer(path: Path, width: int, height: int, fps: float) -> cv2
     raise RuntimeError(f"Could not open video writer for output: {path}")
 
 
+def _write_debug_segmentation_video(
+    label_maps: np.ndarray, output_path: Path, fps: float
+) -> None:
+    if label_maps.size == 0:
+        return
+    h, w = label_maps.shape[1], label_maps.shape[2]
+    writer = _create_video_writer(path=output_path, width=w, height=h, fps=fps)
+    try:
+        for frame_label_map in label_maps:
+            frame_rgb = _render_segmentation_frame(frame_label_map.astype(np.uint8, copy=False))
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            writer.write(frame_bgr)
+    finally:
+        writer.release()
+
+
 def rotate_video_180_inplace(video_path: Path, target_fps: float | None = None) -> None:
     assert cv2 is not None
     cap = cv2.VideoCapture(str(video_path))
@@ -774,6 +909,7 @@ def _run_propagation_for_prompt(
     mask_label_id: int,
     max_frame_num_to_track: int,
     ee_target_pix_by_frame: Dict[int, np.ndarray] | None = None,
+    required_point_xy: tuple[int, int] | None = None,
     start_frame_index: int | None = 0,
     propagation_direction: str = "both",
 ) -> Dict[int, Dict[str, np.ndarray]]:
@@ -805,6 +941,22 @@ def _run_propagation_for_prompt(
         scores = np.asarray(out["out_probs"], dtype=np.float32)
         masks = np.asarray(out["out_binary_masks"])
         if len(scores) == 0 or len(masks) == 0:
+            continue
+
+        if required_point_xy is not None:
+            req_x, req_y = int(required_point_xy[0]), int(required_point_xy[1])
+            selected_idx: int | None = None
+            for idx, mask in enumerate(masks):
+                mask_bool = _to_binary_mask(mask)
+                h, w = mask_bool.shape[:2]
+                if 0 <= req_x < w and 0 <= req_y < h and mask_bool[req_y, req_x]:
+                    selected_idx = idx
+                    break
+            if selected_idx is None:
+                continue
+            best_idx = int(selected_idx)
+            frame_store = outputs_per_frame.setdefault(frame_idx, {})
+            frame_store[mask_label_id] = np.asarray(masks[best_idx])
             continue
 
         target_pix = (
@@ -842,18 +994,14 @@ def _merge_outputs(
             frame_map[int(obj_id)] = np.asarray(mask)
 
 
-def _resize_mask_if_needed(mask: np.ndarray, width: int, height: int) -> np.ndarray:
+def _validate_mask_shape(mask: np.ndarray, width: int, height: int) -> np.ndarray:
     bool_mask = _to_binary_mask(mask)
     if bool_mask.shape == (height, width):
         return bool_mask
-
-    assert cv2 is not None
-    resized = cv2.resize(
-        bool_mask.astype(np.uint8),
-        (width, height),
-        interpolation=cv2.INTER_NEAREST,
+    raise RuntimeError(
+        "Predicted mask shape mismatch. "
+        f"Expected {(height, width)}, got {bool_mask.shape}."
     )
-    return resized > 0
 
 
 def _build_label_map(
@@ -869,7 +1017,7 @@ def _build_label_map(
     for obj_id in sorted(frame_obj_masks.keys()):
         if obj_id not in LABEL_COLORS_RGB:
             continue
-        mask = _resize_mask_if_needed(frame_obj_masks[obj_id], width=width, height=height)
+        mask = _validate_mask_shape(frame_obj_masks[obj_id], width=width, height=height)
         label_map[mask] = np.uint8(obj_id)
     return label_map
 
@@ -905,6 +1053,9 @@ def process_video(
     hand_label_id: int,
     output_fps: float,
     max_frames: int | None,
+    wrist_priming_video_path: Path,
+    downscaled_long_side_px: int | None,
+    chunk_max_frames: int,
 ) -> None:
     info = _open_video_info(video_path)
     # Always track the full length of each video for both views.
@@ -929,25 +1080,66 @@ def process_video(
     if not original_frames:
         raise RuntimeError(f"No frames read from video: {video_path}")
 
-    max_frame_num_to_track = len(original_frames)
+    target_frame_count = len(original_frames)
     n_state = min(len(ee_pos_rows), len(ee_quat_rows))
-    max_frame_num_to_track = min(max_frame_num_to_track, n_state)
-    if max_frame_num_to_track <= 0:
+    target_frame_count = min(target_frame_count, n_state)
+    if target_frame_count <= 0:
         raise RuntimeError(
             f"No overlapping frames between video and pose arrays for video: {video_path}"
         )
-    original_frames = original_frames[:max_frame_num_to_track]
-    preprocessed_frames = [
-        _resize_longest_side(frame, target_longest=1008) for frame in original_frames
-    ]
-    preprocessed_dir = Path(tempfile.mkdtemp(prefix="sam3_preprocessed_frames_"))
-    for idx, frame_rgb in enumerate(preprocessed_frames):
-        Image.fromarray(frame_rgb).save(preprocessed_dir / f"{idx:06d}.jpg", quality=95)
-
-    start_response = predictor.handle_request(
-        request=dict(type="start_session", resource_path=str(preprocessed_dir))
+    original_frames = original_frames[:target_frame_count]
+    is_wrist_view = view_index == WRIST_VIEW_INDEX
+    preprocessed_target_frames: List[np.ndarray]
+    priming_frames: List[np.ndarray] = []
+    input_h, input_w = original_frames[0].shape[:2]
+    target_h, target_w = _compute_scaled_shape(
+        height=input_h,
+        width=input_w,
+        downscaled_long_side_px=downscaled_long_side_px,
     )
-    session_id = start_response["session_id"]
+    if is_wrist_view:
+        if not wrist_priming_video_path.exists():
+            raise FileNotFoundError(
+                f"Wrist priming video not found: {wrist_priming_video_path}"
+            )
+        target_rotated_frames = [np.rot90(frame, k=-1) for frame in original_frames]
+        rotated_h, rotated_w = target_rotated_frames[0].shape[:2]
+        target_h, target_w = _compute_scaled_shape(
+            height=rotated_h,
+            width=rotated_w,
+            downscaled_long_side_px=downscaled_long_side_px,
+        )
+        target_rotated_frames = _resize_frames_to_shape(target_rotated_frames, target_h, target_w)
+        priming_cap = cv2.VideoCapture(str(wrist_priming_video_path))
+        if not priming_cap.isOpened():
+            raise RuntimeError(f"Could not open wrist priming video: {wrist_priming_video_path}")
+        priming_frames: List[np.ndarray] = []
+        try:
+            while True:
+                ok, frame_bgr = priming_cap.read()
+                if not ok:
+                    break
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                priming_frames.append(np.rot90(_ensure_rgb_uint8(frame_rgb), k=1))
+        finally:
+            priming_cap.release()
+        if not priming_frames:
+            raise RuntimeError(f"No frames found in wrist priming video: {wrist_priming_video_path}")
+        # Keep wrist flow behavior consistent with wrist_view_segmentation.py.
+        priming_frames = list(reversed(priming_frames))
+        priming_frames = _resize_frames_to_shape(priming_frames, target_h, target_w)
+        preprocessed_target_frames = target_rotated_frames
+    else:
+        preprocessed_target_frames = _resize_frames_to_shape(original_frames, target_h, target_w)
+    if downscaled_long_side_px is not None:
+        pre_h, pre_w = preprocessed_target_frames[0].shape[:2]
+        print(
+            f"[episode {episode_id} view={view_index}] preprocessing frame size: "
+            f"{input_w}x{input_h} -> {pre_w}x{pre_h}"
+        )
+
+    frame_index_offset = len(priming_frames) if is_wrist_view else 0
+    pre_h, pre_w = preprocessed_target_frames[0].shape[:2]
 
     camera_mode = None
     direction_mode = ""
@@ -958,7 +1150,7 @@ def process_video(
         camera_mode = CAMERA_EXTRINSIC_MODE.get(camera_name, "ee_camera")
         if camera_mode == "base_camera":
             T_base_cam, direction_mode = choose_base_cam_direction(
-                ee_pos_rows=ee_pos_rows[:max_frame_num_to_track],
+                ee_pos_rows=ee_pos_rows[:target_frame_count],
                 T_base_cam_raw=calib.T_ee_camera,
                 K=calib.K,
                 dist=calib.dist,
@@ -969,8 +1161,8 @@ def process_video(
             T_cam_base_static = np.linalg.inv(T_base_cam)
         else:
             T_ee_cam, direction_mode = choose_ee_cam_direction(
-                ee_pos_rows=ee_pos_rows[:max_frame_num_to_track],
-                ee_quat_rows=ee_quat_rows[:max_frame_num_to_track],
+                ee_pos_rows=ee_pos_rows[:target_frame_count],
+                ee_quat_rows=ee_quat_rows[:target_frame_count],
                 T_ee_cam_raw=calib.T_ee_camera,
                 K=calib.K,
                 dist=calib.dist,
@@ -983,12 +1175,11 @@ def process_video(
             f"[episode {episode_id} cam={camera_name}] extrinsic direction: {direction_mode}"
         )
 
-        # SAM3 runs on preprocessed frames. Scale projected EE pixels into that space.
-        pre_h, pre_w = preprocessed_frames[0].shape[:2]
-        sx = pre_w / float(info.width)
-        sy = pre_h / float(info.height)
+        # SAM3 runs on preprocessed frames.
+        scale_x = float(pre_w) / float(info.width)
+        scale_y = float(pre_h) / float(info.height)
         ee_target_pix_by_frame = {}
-        for frame_idx in range(max_frame_num_to_track):
+        for frame_idx in range(target_frame_count):
             ee_pix, _axis_pix, vis = project_ee_and_axes(
                 ee_pos=ee_pos_rows[frame_idx],
                 ee_quat=ee_quat_rows[frame_idx],
@@ -1001,77 +1192,144 @@ def process_video(
             )
             if bool(vis[0]):
                 ee_target_pix_by_frame[frame_idx] = np.asarray(
-                    [ee_pix[0] * sx, ee_pix[1] * sy], dtype=np.float64
+                    [float(ee_pix[0]) * scale_x, float(ee_pix[1]) * scale_y], dtype=np.float64
                 )
-
-    merged_outputs: Dict[int, Dict[int, np.ndarray]] = {}
-    try:
-        for prompt_spec in prompts:
-            prompt_obj_id = int(prompt_spec["obj_id"])
-            mask_label_id = int(prompt_spec.get("label_id", prompt_obj_id))
-            text = str(prompt_spec["text"])
-            if mask_label_id == 0:
-                raise ValueError(
-                    "label_id=0 is reserved for background in this script. "
-                    "Use non-zero label_id (for example 1 for hand, 2 for cube) "
-                    "while keeping prompt obj_id as 0/1 if desired."
-                )
-
-            _ = predictor.handle_request(
-                request=dict(type="reset_session", session_id=session_id)
-            )
-            _ = predictor.handle_request(
-                request=dict(
-                    type="add_prompt",
-                    session_id=session_id,
-                    frame_index=0,
-                    obj_id=prompt_obj_id,
-                    text=text,
-                )
-            )
-
-            propagation_direction = "both"
-            start_frame_index = 0
-            prompt_outputs = _run_propagation_for_prompt(
-                predictor=predictor,
-                session_id=session_id,
-                mask_label_id=mask_label_id,
-                max_frame_num_to_track=max_frame_num_to_track,
-                start_frame_index=start_frame_index,
-                propagation_direction=propagation_direction,
-                ee_target_pix_by_frame=(
-                    ee_target_pix_by_frame
-                    if (view_index == 0 and prompt_obj_id == 0)
-                    else None
-                ),
-            )
-            _merge_outputs(merged_outputs, prompt_outputs)
-    finally:
-        try:
-            _ = predictor.handle_request(
-                request=dict(type="close_session", session_id=session_id)
-            )
-        finally:
-            for jpg_path in preprocessed_dir.glob("*.jpg"):
-                jpg_path.unlink(missing_ok=True)
-            preprocessed_dir.rmdir()
 
     label_maps = np.zeros(
-        (max_frame_num_to_track, info.height, info.width),
+        (target_frame_count, info.height, info.width),
         dtype=np.uint8,
     )
-    for frame_idx in range(max_frame_num_to_track):
-        frame_obj_masks = merged_outputs.get(frame_idx)
-        label_maps[frame_idx] = _build_label_map(
-            frame_obj_masks=frame_obj_masks,
-            width=info.width,
-            height=info.height,
+    chunk_limit = int(chunk_max_frames)
+    if chunk_limit <= 0:
+        chunk_limit = target_frame_count
+    if is_wrist_view:
+        chunk_bounds = _iter_chunk_bounds(target_frame_count, chunk_limit)
+    else:
+        chunk_bounds = [(0, target_frame_count)]
+    required_point_xy_wrist: tuple[int, int] | None = None
+    if is_wrist_view:
+        rotated_h = int(info.width)
+        rotated_w = int(info.height)
+        click_scale_x = float(pre_w) / float(rotated_w)
+        click_scale_y = float(pre_h) / float(rotated_h)
+        click_x = int(round(float(WRIST_CLICK_POINT_XY[0]) * click_scale_x))
+        click_y = int(round(float(WRIST_CLICK_POINT_XY[1]) * click_scale_y))
+        click_x = max(0, min(click_x, pre_w - 1))
+        click_y = max(0, min(click_y, pre_h - 1))
+        required_point_xy_wrist = (click_x, click_y)
+
+    for chunk_idx, (chunk_start, chunk_end) in enumerate(chunk_bounds):
+        chunk_target_frames = preprocessed_target_frames[chunk_start:chunk_end]
+        if is_wrist_view:
+            chunk_frames = [*priming_frames, *chunk_target_frames]
+        else:
+            chunk_frames = chunk_target_frames
+        sam3_frame_num_to_track = len(chunk_frames)
+
+        preprocessed_dir = Path(tempfile.mkdtemp(prefix="sam3_preprocessed_frames_"))
+        for idx, frame_rgb in enumerate(chunk_frames):
+            Image.fromarray(frame_rgb).save(preprocessed_dir / f"{idx:06d}.jpg", quality=95)
+
+        start_response = predictor.handle_request(
+            request=dict(type="start_session", resource_path=str(preprocessed_dir))
         )
+        session_id = start_response["session_id"]
+
+        merged_outputs: Dict[int, Dict[int, np.ndarray]] = {}
+        try:
+            for prompt_spec in prompts:
+                prompt_obj_id = int(prompt_spec["obj_id"])
+                mask_label_id = int(prompt_spec.get("label_id", prompt_obj_id))
+                text = str(prompt_spec["text"])
+                if mask_label_id == 0:
+                    raise ValueError(
+                        "label_id=0 is reserved for background in this script. "
+                        "Use non-zero label_id (for example 1 for hand, 2 for cube) "
+                        "while keeping prompt obj_id as 0/1 if desired."
+                    )
+
+                _ = predictor.handle_request(
+                    request=dict(type="reset_session", session_id=session_id)
+                )
+                _ = predictor.handle_request(
+                    request=dict(
+                        type="add_prompt",
+                        session_id=session_id,
+                        frame_index=0,
+                        obj_id=prompt_obj_id,
+                        text=text,
+                    )
+                )
+
+                chunk_ee_target_pix_by_frame: Dict[int, np.ndarray] | None = None
+                if (
+                    ee_target_pix_by_frame is not None
+                    and view_index == 0
+                    and prompt_obj_id == 0
+                ):
+                    local_targets: Dict[int, np.ndarray] = {}
+                    for local_idx, global_idx in enumerate(range(chunk_start, chunk_end)):
+                        target = ee_target_pix_by_frame.get(global_idx)
+                        if target is not None:
+                            local_targets[local_idx + frame_index_offset] = target
+                    chunk_ee_target_pix_by_frame = local_targets
+
+                propagation_direction = "forward" if is_wrist_view else "both"
+                prompt_outputs = _run_propagation_for_prompt(
+                    predictor=predictor,
+                    session_id=session_id,
+                    mask_label_id=mask_label_id,
+                    max_frame_num_to_track=sam3_frame_num_to_track,
+                    start_frame_index=0,
+                    propagation_direction=propagation_direction,
+                    ee_target_pix_by_frame=chunk_ee_target_pix_by_frame,
+                    required_point_xy=(
+                        required_point_xy_wrist
+                        if (is_wrist_view and mask_label_id == hand_label_id)
+                        else None
+                    ),
+                )
+                _merge_outputs(merged_outputs, prompt_outputs)
+        finally:
+            try:
+                _ = predictor.handle_request(
+                    request=dict(type="close_session", session_id=session_id)
+                )
+            finally:
+                for jpg_path in preprocessed_dir.glob("*.jpg"):
+                    jpg_path.unlink(missing_ok=True)
+                preprocessed_dir.rmdir()
+
+        for local_idx in range(chunk_end - chunk_start):
+            sam3_frame_idx = local_idx + frame_index_offset
+            frame_obj_masks = merged_outputs.get(sam3_frame_idx)
+            frame_label_map = _build_label_map(
+                frame_obj_masks=frame_obj_masks,
+                width=pre_w,
+                height=pre_h,
+            )
+            if is_wrist_view:
+                frame_label_map = np.rot90(frame_label_map, k=1)
+            if frame_label_map.shape != (info.height, info.width):
+                frame_label_map = np.asarray(
+                    Image.fromarray(frame_label_map).resize(
+                        (info.width, info.height), resample=Image.NEAREST
+                    ),
+                    dtype=np.uint8,
+                )
+            label_maps[chunk_start + local_idx] = frame_label_map
+
+        if len(chunk_bounds) > 1:
+            print(
+                f"[episode {episode_id} view={view_index}] "
+                f"chunk {chunk_idx + 1}/{len(chunk_bounds)} done "
+                f"frames {chunk_start}-{chunk_end - 1}"
+            )
 
     debug_indices: List[int] = []
-    if debug_projection_images > 0 and max_frame_num_to_track > 0:
-        n_debug = min(debug_projection_images, max_frame_num_to_track)
-        debug_indices = np.linspace(0, max_frame_num_to_track - 1, n_debug, dtype=int).tolist()
+    if debug_projection_images > 0 and target_frame_count > 0:
+        n_debug = min(debug_projection_images, target_frame_count)
+        debug_indices = np.linspace(0, target_frame_count - 1, n_debug, dtype=int).tolist()
         debug_dir.mkdir(parents=True, exist_ok=True)
 
     writer = _create_video_writer(
@@ -1082,7 +1340,7 @@ def process_video(
     )
     filtered_label_maps = np.zeros_like(label_maps)
     try:
-        for frame_idx in range(max_frame_num_to_track):
+        for frame_idx in range(target_frame_count):
             frame_label_map = label_maps[frame_idx].copy()
 
             if calib is not None and camera_mode is not None:
@@ -1127,7 +1385,7 @@ def process_video(
     if debug_indices:
         print(f"[done] projection debug images: {debug_dir}")
     print(
-        f"[done] frames={max_frame_num_to_track} "
+        f"[done] frames={target_frame_count} "
         f"labels={np.unique(filtered_label_maps).tolist()}"
     )
 
@@ -1167,6 +1425,9 @@ def main() -> None:
     else:
         episode_ids = sorted(set(int(x) for x in args.episode_ids))
     rotate_view1_episode_ids = _parse_episode_id_tokens(args.rotate_view1_episode_ids)
+    recompute_wrist_episode_ids = _parse_episode_id_tokens(args.recompute_wrist_episode_ids)
+    recompute_third_episode_ids = _parse_episode_id_tokens(args.recompute_third_episode_ids)
+    recompute_both_episode_ids = _parse_episode_id_tokens(args.recompute_both_episode_ids)
 
     calibration_map = load_calibration_map(args.calibration_dir)
     predictor = build_sam3_video_predictor()
@@ -1189,7 +1450,17 @@ def main() -> None:
                 )
                 episode_id = ann_episode_id
 
-            for view_index in (0, 1):
+            selected_views, recompute_mode = _views_to_recompute_for_episode(
+                requested_episode_id=requested_episode_id,
+                annotation_episode_id=episode_id,
+                recompute_wrist_episode_ids=recompute_wrist_episode_ids,
+                recompute_third_episode_ids=recompute_third_episode_ids,
+                recompute_both_episode_ids=recompute_both_episode_ids,
+            )
+            if recompute_mode and not selected_views:
+                continue
+
+            for view_index in sorted(selected_views):
                 input_video_path = episode_dir / f"{view_index}_rgb.mp4"
                 if not input_video_path.exists():
                     print(f"[warning] Missing input video: {input_video_path}")
@@ -1257,6 +1528,9 @@ def main() -> None:
                     hand_label_id=args.hand_label_id,
                     output_fps=args.output_fps,
                     max_frames=args.max_frames,
+                    wrist_priming_video_path=args.wrist_priming_video_path,
+                    downscaled_long_side_px=args.downscaled_long_side_px,
+                    chunk_max_frames=args.chunk_max_frames,
                 )
     finally:
         predictor.shutdown()
