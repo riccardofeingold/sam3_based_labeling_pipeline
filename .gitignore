@@ -154,3 +154,6 @@ Thumbs.db
 .history/*
 
 test_le_robot_dataset/
+output/
+output_generic/
+wrist_*
