@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 try:
     import pybullet as p
@@ -65,7 +65,8 @@ FINGER_ORDER = ("thumb", "index", "middle", "ring", "pinky")
 FINGER_LABEL_ID = {name: idx + 1 for idx, name in enumerate(FINGER_ORDER)}
 
 # Matches current calibration scripts in this repository.
-DEFAULT_EE_TRANSLATION_OFFSET = np.array([0.04403478458607229, -0.023583276493303752, 0.17973690165554085], dtype=np.float64)
+DEFAULT_EE_TRANSLATION_OFFSET_FOR_SIDE_VIEW = np.array([0.04403478458607229, -0.023583276493303752, 0.17973690165554085], dtype=np.float64)
+DEFAULT_EE_TRANSLATION_OFFSET_FOR_WRIST_VIEW = np.array([0.0, 0.07, 0.13], dtype=np.float64)
 
 # Fallback if no fingertip links and no reference URDF fingertip joints are found.
 FALLBACK_TIP_SPECS = {
@@ -75,6 +76,7 @@ FALLBACK_TIP_SPECS = {
     "ring": ("ring_ip", np.array([-0.009, 0.0, 0.04], dtype=np.float64)),
     "pinky": ("pinky_ip", np.array([-0.009, 0.0, 0.04], dtype=np.float64)),
 }
+EXCLUDED_HAND_MASK_LINK_NAMES = {"tower"}
 
 # Order from assets/orcahand_v1b/scheme_orcahand_v1b.yaml (gc_tendons).
 HAND_JOINT_ORDER = [
@@ -118,6 +120,15 @@ HAND_JOINT_ORDER = [
 #     "joint_pip_pinky"]
 
 DEFAULT_HAND_ROOT_EXTRA_ROT_DEG = np.array([90.0, 90.0, 0.0], dtype=np.float64)
+# Fixed wrist-view correction: -90 deg about X, then -90 deg about Y.
+WRIST_VIEW_ROT_XY_NEG90 = np.array(
+    [
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0],
+    ],
+    dtype=np.float64,
+)
 
 
 @dataclass
@@ -231,8 +242,12 @@ def parse_args() -> argparse.Namespace:
         "--ee-translation-offset",
         type=float,
         nargs=3,
-        default=list(DEFAULT_EE_TRANSLATION_OFFSET),
-        help="Offset used by existing calibration chain for ee_camera mode.",
+        default=None,
+        help=(
+            "Override EE translation offset. If omitted, uses "
+            "DEFAULT_EE_TRANSLATION_OFFSET_FOR_WRIST_VIEW for wrist view and "
+            "DEFAULT_EE_TRANSLATION_OFFSET_FOR_SIDE_VIEW for side view."
+        ),
     )
     parser.add_argument(
         "--hand-root-extra-rot-deg",
@@ -305,6 +320,17 @@ def parse_args() -> argparse.Namespace:
         "--save-rgb",
         action="store_true",
         help="Also save rendered RGB image.",
+    )
+    parser.add_argument(
+        "--no-hand-root-frame-overlay",
+        action="store_true",
+        help="Disable drawing the hand-root XYZ frame overlay in rendered RGB outputs.",
+    )
+    parser.add_argument(
+        "--hand-root-frame-axis-length",
+        type=float,
+        default=0.05,
+        help="Axis length (meters) used for hand-root frame RGB overlay.",
     )
     parser.add_argument(
         "--save-per-finger-masks",
@@ -395,6 +421,20 @@ def load_calibration_map(calibration_dir: Path) -> Dict[str, Calibration]:
     with extr_path.open("rb") as f:
         extr_data = pickle.load(f)
 
+    def apply_wrist_view_xy_neg90(extrinsic_in: np.ndarray) -> np.ndarray:
+        mat = np.asarray(extrinsic_in, dtype=np.float64)
+        if mat.shape != (4, 4):
+            raise ValueError(f"Expected 4x4 extrinsic matrix, got {mat.shape}")
+        R = mat[:3, :3]
+        t = mat[:3, 3]
+        R_new = WRIST_VIEW_ROT_XY_NEG90 @ R
+        t_new = WRIST_VIEW_ROT_XY_NEG90 @ t
+
+        out = np.eye(4, dtype=np.float64)
+        out[:3, :3] = R_new
+        out[:3, 3] = t_new
+        return out
+
     extr_map: Dict[str, np.ndarray] = {}
     if isinstance(extr_data, list):
         for item in extr_data:
@@ -402,7 +442,10 @@ def load_calibration_map(calibration_dir: Path) -> Dict[str, Calibration]:
                 name = str(item[0])
                 mat = np.asarray(item[1], dtype=np.float64)
                 if mat.shape == (4, 4):
-                    extr_map[name] = mat
+                    if name == "oakd_wrist_view":
+                        extr_map[name] = apply_wrist_view_xy_neg90(mat)
+                    else:
+                        extr_map[name] = mat
 
     out: Dict[str, Calibration] = {}
     if isinstance(intr_data, dict):
@@ -572,6 +615,16 @@ def resolve_camera_mode(camera_name: str, mode_arg: str) -> str:
     return CAMERA_EXTRINSIC_MODE.get(camera_name, "base_camera")
 
 
+def resolve_ee_translation_offset(
+    camera_name: str, override_xyz: Optional[Iterable[float]]
+) -> np.ndarray:
+    if override_xyz is not None:
+        return np.asarray(list(override_xyz), dtype=np.float64).reshape(3)
+    if camera_name == "oakd_wrist_view":
+        return DEFAULT_EE_TRANSLATION_OFFSET_FOR_WRIST_VIEW.copy()
+    return DEFAULT_EE_TRANSLATION_OFFSET_FOR_SIDE_VIEW.copy()
+
+
 def intrinsics_to_opengl_projection(
     K: np.ndarray,
     width: int,
@@ -645,8 +698,110 @@ def project_point_with_view_projection(
     return cam_cv, np.array([u, v], dtype=np.float64)
 
 
+def _project_world_point_for_render(
+    point_world: np.ndarray,
+    camera_setup: str,
+    T_world_camera: Optional[np.ndarray],
+    K: Optional[np.ndarray],
+    view_matrix: List[float],
+    projection_matrix: List[float],
+    width: int,
+    height: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if camera_setup == "calibrated":
+        if T_world_camera is None or K is None:
+            raise ValueError("Calibrated projection requires T_world_camera and K.")
+        return project_point_camera(point_world, T_world_camera, K)
+    return project_point_with_view_projection(
+        point_world=point_world,
+        view_matrix=view_matrix,
+        projection_matrix=projection_matrix,
+        width=width,
+        height=height,
+    )
+
+
+def overlay_hand_root_frame_on_rgb(
+    rgb: np.ndarray,
+    T_world_root: np.ndarray,
+    camera_setup: str,
+    T_world_camera: Optional[np.ndarray],
+    K: Optional[np.ndarray],
+    view_matrix: List[float],
+    projection_matrix: List[float],
+    axis_length_m: float,
+) -> np.ndarray:
+    arr = np.asarray(rgb, dtype=np.uint8)
+    if arr.ndim != 3 or arr.shape[2] < 3:
+        return arr
+
+    h, w = arr.shape[:2]
+    origin = T_world_root[:3, 3]
+    R = T_world_root[:3, :3]
+    axis_len = float(max(1e-6, axis_length_m))
+    axis_points = {
+        "x": origin + R[:, 0] * axis_len,
+        "y": origin + R[:, 1] * axis_len,
+        "z": origin + R[:, 2] * axis_len,
+    }
+
+    origin_cam, origin_pix = _project_world_point_for_render(
+        point_world=origin,
+        camera_setup=camera_setup,
+        T_world_camera=T_world_camera,
+        K=K,
+        view_matrix=view_matrix,
+        projection_matrix=projection_matrix,
+        width=w,
+        height=h,
+    )
+    if origin_cam[2] <= 1e-9:
+        return arr
+
+    img = Image.fromarray(arr[:, :, :3], mode="RGB")
+    draw = ImageDraw.Draw(img)
+    origin_xy = (float(origin_pix[0]), float(origin_pix[1]))
+    draw.ellipse(
+        [
+            origin_xy[0] - 3.0,
+            origin_xy[1] - 3.0,
+            origin_xy[0] + 3.0,
+            origin_xy[1] + 3.0,
+        ],
+        fill=(255, 255, 255),
+    )
+
+    axis_colors = {"x": (255, 32, 32), "y": (32, 220, 32), "z": (32, 96, 255)}
+    for axis_name, axis_world in axis_points.items():
+        axis_cam, axis_pix = _project_world_point_for_render(
+            point_world=axis_world,
+            camera_setup=camera_setup,
+            T_world_camera=T_world_camera,
+            K=K,
+            view_matrix=view_matrix,
+            projection_matrix=projection_matrix,
+            width=w,
+            height=h,
+        )
+        if axis_cam[2] <= 1e-9:
+            continue
+        endpoint_xy = (float(axis_pix[0]), float(axis_pix[1]))
+        draw.line([origin_xy, endpoint_xy], fill=axis_colors[axis_name], width=3)
+        draw.ellipse(
+            [
+                endpoint_xy[0] - 2.0,
+                endpoint_xy[1] - 2.0,
+                endpoint_xy[0] + 2.0,
+                endpoint_xy[1] + 2.0,
+            ],
+            fill=axis_colors[axis_name],
+        )
+        draw.text((endpoint_xy[0] + 2.0, endpoint_xy[1] + 2.0), axis_name, fill=axis_colors[axis_name])
+    return np.asarray(img, dtype=np.uint8)
+
+
 def decode_hand_segmentation(
-    segmentation: np.ndarray, body_id: int
+    segmentation: np.ndarray, body_id: int, excluded_link_indices: Optional[set[int]] = None
 ) -> Tuple[np.ndarray, np.ndarray, bool]:
     seg = np.asarray(segmentation, dtype=np.int32)
     # In some renderer/backend combinations the segmentation buffer is all zeros.
@@ -662,6 +817,9 @@ def decode_hand_segmentation(
     object_uid = seg & ((1 << 24) - 1)
     link_idx = (seg >> 24) - 1
     hand_pixels = valid & (object_uid == int(body_id))
+    if excluded_link_indices:
+        excluded = np.isin(link_idx, np.asarray(sorted(excluded_link_indices), dtype=np.int32))
+        hand_pixels = hand_pixels & (~excluded)
     return hand_pixels, link_idx, False
 
 
@@ -872,6 +1030,15 @@ def _resize_mask_nearest(mask: np.ndarray, width: int, height: int) -> np.ndarra
     return np.asarray(resized, dtype=np.uint8) > 127
 
 
+def _resize_rgb_bilinear(frame_rgb: np.ndarray, width: int, height: int) -> np.ndarray:
+    arr = np.asarray(frame_rgb, dtype=np.uint8)
+    if arr.shape[:2] == (height, width):
+        return arr
+    img = Image.fromarray(arr, mode="RGB")
+    resized = img.resize((int(width), int(height)), resample=Image.BILINEAR)
+    return np.asarray(resized, dtype=np.uint8)
+
+
 def _mask_iou(a: np.ndarray, b: np.ndarray) -> float:
     aa = np.asarray(a, dtype=bool)
     bb = np.asarray(b, dtype=bool)
@@ -945,6 +1112,36 @@ def load_green_masks_for_indices(
         if len(frames_out) == len(target):
             break
     return frames_out
+
+
+def probe_video_frame_size(video_path: Path) -> Optional[Tuple[int, int]]:
+    if not video_path.exists():
+        return None
+    try:
+        import cv2  # type: ignore
+    except Exception:
+        cv2 = None
+    if cv2 is not None:
+        cap = cv2.VideoCapture(str(video_path))
+        if cap.isOpened():
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+            if w > 0 and h > 0:
+                return (w, h)
+    try:
+        import imageio.v3 as iio  # type: ignore
+    except Exception:
+        return None
+    try:
+        for frame in iio.imiter(str(video_path)):
+            arr = np.asarray(frame, dtype=np.uint8)
+            if arr.ndim >= 2:
+                return (int(arr.shape[1]), int(arr.shape[0]))
+            break
+    except Exception:
+        return None
+    return None
 
 
 def render_with_fallback(
@@ -1102,6 +1299,9 @@ def run_dataset_mode(args: argparse.Namespace) -> None:
         raise RuntimeError("No matching episode ids selected.")
 
     camera_name = pick_camera_name(args)
+    resolved_ee_offset_default = resolve_ee_translation_offset(
+        camera_name=camera_name, override_xyz=args.ee_translation_offset
+    )
     calib: Optional[Calibration] = None
     if args.camera_setup == "calibrated":
         calibration_map = load_calibration_map(args.calibration_dir)
@@ -1164,6 +1364,11 @@ def run_dataset_mode(args: argparse.Namespace) -> None:
             link_name_to_idx=link_name_to_idx,
             main_urdf_path=args.urdf_path,
         )
+        excluded_mask_link_indices = {
+            int(link_name_to_idx[name])
+            for name in EXCLUDED_HAND_MASK_LINK_NAMES
+            if name in link_name_to_idx
+        }
 
         mode = "generic_camera" if args.camera_setup == "generic" else resolve_camera_mode(
             camera_name, args.camera_mode
@@ -1195,6 +1400,28 @@ def run_dataset_mode(args: argparse.Namespace) -> None:
             ann_path = files_by_id[ep_id]
             with ann_path.open("r", encoding="utf-8") as f:
                 ann = json.load(f)
+            if args.camera_index is not None:
+                view_index = int(args.camera_index)
+            else:
+                view_index = CAMERA_TO_VIDEO_INDEX.get(camera_name, -1)
+            episode_seg_video_path: Optional[Path] = None
+            if view_index >= 0:
+                episode_seg_video_path = resolve_segmentation_video_path(
+                    annotation_data=ann,
+                    dataset_base_dir=dataset_base_dir,
+                    view_index=view_index,
+                )
+                if episode_seg_video_path is None:
+                    fallback_seg = dataset_base_dir / "segmentation_videos" / str(ep_id) / f"{view_index}.mp4"
+                    if fallback_seg.exists():
+                        episode_seg_video_path = fallback_seg.resolve()
+            dataset_video_size = (
+                probe_video_frame_size(episode_seg_video_path)
+                if episode_seg_video_path is not None
+                else None
+            )
+            output_video_width = int(dataset_video_size[0]) if dataset_video_size is not None else int(args.width)
+            output_video_height = int(dataset_video_size[1]) if dataset_video_size is not None else int(args.height)
 
             joint_key = (
                 "action.hand_joint_position"
@@ -1241,7 +1468,7 @@ def run_dataset_mode(args: argparse.Namespace) -> None:
             if frame_count <= 0:
                 print(f"[warning][episode {ep_id}] No frames to render; skipping.")
                 continue
-            episode_ee_offset = np.asarray(args.ee_translation_offset, dtype=np.float64).reshape(3)
+            episode_ee_offset = np.asarray(resolved_ee_offset_default, dtype=np.float64).reshape(3).copy()
             episode_root_rot_deg = (
                 np.asarray(args.hand_root_extra_rot_deg, dtype=np.float64).reshape(3).copy()
             )
@@ -1286,6 +1513,15 @@ def run_dataset_mode(args: argparse.Namespace) -> None:
                 "green_dominance": int(args.green_dominance),
                 "initial_offset_xyz": episode_ee_offset.tolist(),
                 "initial_hand_root_extra_rot_xyz_deg": episode_root_rot_deg.tolist(),
+                "view_index": int(view_index),
+                "segmentation_video_path": (
+                    str(episode_seg_video_path) if episode_seg_video_path is not None else None
+                ),
+                "dataset_video_size": (
+                    [int(dataset_video_size[0]), int(dataset_video_size[1])]
+                    if dataset_video_size is not None
+                    else None
+                ),
             }
             preferred_renderer: Optional[Tuple[str, int]] = None
 
@@ -1359,32 +1595,12 @@ def run_dataset_mode(args: argparse.Namespace) -> None:
                 elif chosen_extrinsic is None or calib is None:
                     optimization_info["status"] = "skipped_missing_calibration_state"
                 else:
-                    if args.camera_index is not None:
-                        view_index = int(args.camera_index)
-                    else:
-                        view_index = CAMERA_TO_VIDEO_INDEX.get(camera_name, -1)
-                    optimization_info["view_index"] = int(view_index)
-
-                    seg_video_path: Optional[Path] = None
-                    if view_index >= 0:
-                        seg_video_path = resolve_segmentation_video_path(
-                            annotation_data=ann,
-                            dataset_base_dir=dataset_base_dir,
-                            view_index=view_index,
-                        )
-                        if seg_video_path is None:
-                            fallback_seg = (
-                                dataset_base_dir / "segmentation_videos" / str(ep_id) / f"{view_index}.mp4"
-                            )
-                            if fallback_seg.exists():
-                                seg_video_path = fallback_seg.resolve()
-                    if seg_video_path is None:
+                    if episode_seg_video_path is None:
                         optimization_info["status"] = "skipped_missing_segmentation_video_path"
                     else:
-                        optimization_info["segmentation_video_path"] = str(seg_video_path)
                         sample_idxs = sample_frame_indices(frame_count, args.optimize_frames)
                         target_masks = load_green_masks_for_indices(
-                            video_path=seg_video_path,
+                            video_path=episode_seg_video_path,
                             frame_indices=sample_idxs,
                             width=None,
                             height=None,
@@ -1449,7 +1665,7 @@ def run_dataset_mode(args: argparse.Namespace) -> None:
                                             args.height, args.width
                                         )
                                         hand_mask, _link_idx_map, _seg_degenerate = decode_hand_segmentation(
-                                            seg, body_id
+                                            seg, body_id, excluded_link_indices=excluded_mask_link_indices
                                         )
                                         target_mask = np.asarray(target_masks[frame_idx], dtype=bool)
                                         target_h, target_w = target_mask.shape[:2]
@@ -1558,8 +1774,22 @@ def run_dataset_mode(args: argparse.Namespace) -> None:
 
                     rgba = np.asarray(cam[2], dtype=np.uint8).reshape(args.height, args.width, 4)
                     rgb = rgba[:, :, :3]
+                    if not args.no_hand_root_frame_overlay:
+                        T_world_root = world_link_transform(body_id, -1)
+                        rgb = overlay_hand_root_frame_on_rgb(
+                            rgb=rgb,
+                            T_world_root=T_world_root,
+                            camera_setup=args.camera_setup,
+                            T_world_camera=T_world_camera,
+                            K=(calib.K if calib is not None else None),
+                            view_matrix=view_matrix,
+                            projection_matrix=projection_matrix,
+                            axis_length_m=float(args.hand_root_frame_axis_length),
+                        )
                     seg = np.asarray(cam[4], dtype=np.int32).reshape(args.height, args.width)
-                    hand_mask, link_idx_map, seg_degenerate = decode_hand_segmentation(seg, body_id)
+                    hand_mask, link_idx_map, seg_degenerate = decode_hand_segmentation(
+                        seg, body_id, excluded_link_indices=excluded_mask_link_indices
+                    )
                     if seg_degenerate:
                         seg_degenerate_frames += 1
 
@@ -1617,8 +1847,23 @@ def run_dataset_mode(args: argparse.Namespace) -> None:
                             "mask_pixel_count": int(np.count_nonzero(chosen_mask)),
                         }
 
-                    rgb_video_frames.append(np.asarray(rgb, dtype=np.uint8))
+                    rgb_out = _resize_rgb_bilinear(
+                        np.asarray(rgb, dtype=np.uint8),
+                        width=output_video_width,
+                        height=output_video_height,
+                    )
+                    rgb_video_frames.append(rgb_out)
                     hand_mask_vis = np.where(hand_mask, 255, 0).astype(np.uint8)
+                    if hand_mask_vis.shape != (output_video_height, output_video_width):
+                        hand_mask_vis = np.where(
+                            _resize_mask_nearest(
+                                hand_mask,
+                                width=output_video_width,
+                                height=output_video_height,
+                            ),
+                            255,
+                            0,
+                        ).astype(np.uint8)
                     hand_mask_rgb = np.repeat(hand_mask_vis[:, :, None], 3, axis=2)
                     hand_mask_video_frames.append(hand_mask_rgb)
                     Image.fromarray(label_map, mode="L").save(label_map_dir / f"{frame_idx:06d}.png")
@@ -1666,6 +1911,7 @@ def run_dataset_mode(args: argparse.Namespace) -> None:
                 "rgb_video_path": str(rgb_video_path),
                 "hand_mask_video_path": str(hand_mask_video_path),
                 "video_fps": float(args.video_fps),
+                "output_video_size": [int(output_video_width), int(output_video_height)],
                 "hand_joint_source_key": joint_key,
                 "end_effector_pose_key": args.palm_pose_key,
                 "end_effector_offset_applied_at_root_xyz": episode_ee_offset.tolist(),
@@ -1673,6 +1919,10 @@ def run_dataset_mode(args: argparse.Namespace) -> None:
                 "hand_root_extra_rot_xyz_rad": episode_root_rot_rad.tolist(),
                 "hand_joint_order": HAND_JOINT_ORDER,
                 "image_size": [args.width, args.height],
+                "hand_root_frame_overlay": {
+                    "enabled": bool(not args.no_hand_root_frame_overlay),
+                    "axis_length_m": float(args.hand_root_frame_axis_length),
+                },
                 "rewritten_mesh_paths": bool(rewritten_mesh_paths),
                 "alignment_optimization": optimization_info,
                 "first_frame_joint_override": "zero",
@@ -1708,6 +1958,9 @@ def main() -> None:
         raise FileNotFoundError(f"URDF not found: {args.urdf_path}")
 
     camera_name = pick_camera_name(args)
+    resolved_ee_offset_default = resolve_ee_translation_offset(
+        camera_name=camera_name, override_xyz=args.ee_translation_offset
+    )
     calib: Optional[Calibration] = None
     if args.camera_setup == "calibrated":
         calibration_map = load_calibration_map(args.calibration_dir)
@@ -1778,6 +2031,11 @@ def main() -> None:
             link_name_to_idx=link_name_to_idx,
             main_urdf_path=args.urdf_path,
         )
+        excluded_mask_link_indices = {
+            int(link_name_to_idx[name])
+            for name in EXCLUDED_HAND_MASK_LINK_NAMES
+            if name in link_name_to_idx
+        }
 
         mode = "generic_camera" if args.camera_setup == "generic" else resolve_camera_mode(
             camera_name, args.camera_mode
@@ -1789,7 +2047,7 @@ def main() -> None:
         if args.camera_setup == "calibrated":
             assert calib is not None
             extrinsic_raw = np.asarray(calib.extrinsic, dtype=np.float64)
-            ee_offset = np.asarray(args.ee_translation_offset, dtype=np.float64).reshape(3)
+            ee_offset = np.asarray(resolved_ee_offset_default, dtype=np.float64).reshape(3)
 
             extrinsic_direction_mode = "forced_raw"
             if args.invert_extrinsic:
@@ -1931,8 +2189,22 @@ def main() -> None:
 
         rgba = np.asarray(cam[2], dtype=np.uint8).reshape(args.height, args.width, 4)
         rgb = rgba[:, :, :3]
+        if not args.no_hand_root_frame_overlay:
+            T_world_root = world_link_transform(body_id, -1)
+            rgb = overlay_hand_root_frame_on_rgb(
+                rgb=rgb,
+                T_world_root=T_world_root,
+                camera_setup=args.camera_setup,
+                T_world_camera=T_world_camera,
+                K=(calib.K if calib is not None else None),
+                view_matrix=view_matrix,
+                projection_matrix=projection_matrix,
+                axis_length_m=float(args.hand_root_frame_axis_length),
+            )
         seg = np.asarray(cam[4], dtype=np.int32).reshape(args.height, args.width)
-        hand_mask, link_idx_map, seg_degenerate = decode_hand_segmentation(seg, body_id)
+        hand_mask, link_idx_map, seg_degenerate = decode_hand_segmentation(
+            seg, body_id, excluded_link_indices=excluded_mask_link_indices
+        )
         if seg_degenerate:
             print(
                 "[warning] Segmentation buffer is all zeros. "
@@ -2017,6 +2289,10 @@ def main() -> None:
             "calibration_dir": str(args.calibration_dir),
             "image_size": [args.width, args.height],
             "near_far": [args.near, args.far],
+            "hand_root_frame_overlay": {
+                "enabled": bool(not args.no_hand_root_frame_overlay),
+                "axis_length_m": float(args.hand_root_frame_axis_length),
+            },
             "joint_overrides": overrides,
             "hand_mask_pixel_count": int(np.count_nonzero(hand_mask)),
             "fingertips": fingertip_payload,
