@@ -13,13 +13,13 @@
          <mass value="3.914536228486332"/>
          <inertia ixx="0.006344807113813945" iyy="0.005501052442445608" izz="0.0032062353988468895" ixy="0" ixz="0" iyz="0"/>
       </inertial>
-      <!-- <visual name="tower_mesh">
+      <visual name="tower_mesh">
          <origin xyz="0.040332210450118706 0.002125801351270809 0.01968127925815741" rpy="0.03116389785565373 0.006594058324928431 0.05135791026908915"/>
          <geometry>
             <mesh filename="assets/orcahand_v1b/urdf/converted_tower_mesh.stl"/>
          </geometry>
          <material name="white"/>
-      </visual> -->
+      </visual>
    </link>
    <link name="root2tower_fixed_jointbody">
       <inertial>
