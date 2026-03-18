@@ -43,8 +43,8 @@
     <!-- ======== -->
     <body euler="0 0 0" pos="0.0 0.0 0.0" name="root">
       <freejoint/>
-      <body euler="0 0 0" name="ee_link" pos="0.15 0.04 -0.01">
-        <body euler="0 0 0" name="hand_mount" pos="-0.13 0.0 -0.07">
+      <body euler="0 0 0" name="ee_link" pos="0.1306292485678194 0.04091061255047069 0.03655199144429491">
+        <body euler="0 0 0" name="hand_mount" pos="-0.14561649718462527 -0.009333262596796926 -0.09993027599944532">
           <camera name="wrist_view_camera" pos="0 0 0" quat="1 0 0 0"/>
         </body>
       </body>

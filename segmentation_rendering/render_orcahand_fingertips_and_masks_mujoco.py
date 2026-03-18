@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import pickle
 import time
@@ -90,6 +91,9 @@ CAMERA_REFERENCE_LINK = {
     "oakd_wrist_view": "hand_mount",
 }
 OPENCV_CAMERA_TO_MUJOCO_CAMERA_ROT = np.diag([1.0, -1.0, -1.0]).astype(np.float64)
+EE_LINK_OPTIMIZATION_CAMERA = "oakd_side_view"
+HAND_MOUNT_OPTIMIZATION_CAMERA = "oakd_wrist_view"
+HAND_MOUNT_BODY_NAME = "hand_mount"
 
 FINGER_ORDER = ("thumb", "index", "middle", "ring", "pinky")
 FINGER_LABEL_ID = {name: idx + 1 for idx, name in enumerate(FINGER_ORDER)}
@@ -152,6 +156,7 @@ class DatasetCameraTarget:
     calib: Calibration
     mode: str
     ee_offset: np.ndarray
+    real_seg_video_path: Optional[Path]
     view_index: int
     output_video_width: int
     output_video_height: int
@@ -161,6 +166,19 @@ class DatasetCameraTarget:
     label_map_dir: Path
     per_finger_base_dir: Path
     lines_path: Path
+
+
+@dataclass
+class OptimizationEpisodeData:
+    ep_id: int
+    ann_path: Path
+    joint_key: str
+    joint_seq: np.ndarray
+    ee_pose_seq: np.ndarray
+    frame_count: int
+    frame_indices: List[int]
+    real_masks_by_camera: Dict[str, Dict[int, np.ndarray]]
+    camera_targets: List[DatasetCameraTarget]
 
 
 def parse_args() -> argparse.Namespace:
@@ -294,6 +312,44 @@ def parse_args() -> argparse.Namespace:
         "--show-viewer",
         action="store_true",
         help="Open an onscreen MuJoCo viewer window for debugging.",
+    )
+    parser.add_argument(
+        "--optimize-ee-link-offset",
+        action="store_true",
+        help=(
+            "Run sequential position optimization: first ee_link with third view only, "
+            "then hand_mount with wrist view only."
+        ),
+    )
+    parser.add_argument(
+        "--ee-link-offset-search-range",
+        type=float,
+        default=0.03,
+        help="Symmetric search range in meters for each ee_link local translation axis during optimization.",
+    )
+    parser.add_argument(
+        "--ee-link-offset-bayes-init",
+        type=int,
+        default=8,
+        help="Number of initial random evaluations for Bayesian optimization.",
+    )
+    parser.add_argument(
+        "--ee-link-offset-bayes-iters",
+        type=int,
+        default=100,
+        help="Total number of ee_link offset evaluations for Bayesian optimization.",
+    )
+    parser.add_argument(
+        "--ee-link-offset-frame-stride",
+        type=int,
+        default=5,
+        help="Evaluate every Nth frame from the real segmentation videos during optimization.",
+    )
+    parser.add_argument(
+        "--ee-link-offset-max-frames",
+        type=int,
+        default=20,
+        help="Maximum sampled frames per episode for optimization. Use <= 0 for no cap.",
     )
     return parser.parse_args()
 
@@ -576,19 +632,110 @@ def probe_video_frame_size(video_path: Path) -> Optional[Tuple[int, int]]:
             cap.release()
             if w > 0 and h > 0:
                 return (w, h)
-    try:
-        import imageio.v3 as iio  # type: ignore
-    except Exception:
-        return None
-    try:
-        for frame in iio.imiter(str(video_path)):
-            arr = np.asarray(frame, dtype=np.uint8)
-            if arr.ndim >= 2:
-                return (int(arr.shape[1]), int(arr.shape[0]))
-            break
-    except Exception:
-        return None
     return None
+
+
+def load_video_frames_mediapy(video_path: Path) -> np.ndarray:
+    if media is None:
+        raise ImportError(
+            "mediapy is required for video loading. "
+            f"Import error: {MEDIAPY_IMPORT_ERROR}"
+        )
+    if not video_path.exists():
+        raise FileNotFoundError(f"Video file not found: {video_path}")
+    frames = media.read_video(str(video_path))
+    arr = np.asarray(frames, dtype=np.uint8)
+    if arr.ndim != 4 or arr.shape[-1] < 3:
+        raise ValueError(f"Expected RGB video frames from {video_path}, got shape {arr.shape}")
+    return arr
+
+
+def extract_green_hand_mask(frame_rgb: np.ndarray) -> np.ndarray:
+    arr = np.asarray(frame_rgb, dtype=np.uint8)
+    if arr.ndim != 3 or arr.shape[2] < 3:
+        raise ValueError(f"Expected RGB frame, got shape {arr.shape}")
+    r = arr[:, :, 0].astype(np.int16)
+    g = arr[:, :, 1].astype(np.int16)
+    b = arr[:, :, 2].astype(np.int16)
+    return (g >= 200) & (r <= 70) & (b <= 70)
+
+
+def downscale_sim_mask_for_segmentation_video(mask: np.ndarray) -> np.ndarray:
+    return _resize_mask_nearest(mask, width=240, height=135)
+
+
+def sample_frame_indices(frame_count: int, stride: int, max_frames: int) -> List[int]:
+    step = max(1, int(stride))
+    indices = list(range(0, int(frame_count), step))
+    if max_frames > 0 and len(indices) > int(max_frames):
+        if int(max_frames) == 1:
+            return [indices[0]]
+        sample_pos = np.linspace(0, len(indices) - 1, int(max_frames))
+        indices = [indices[int(round(v))] for v in sample_pos]
+    return sorted(set(int(i) for i in indices if 0 <= int(i) < int(frame_count)))
+
+
+def mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+    a = np.asarray(mask_a, dtype=bool)
+    b = np.asarray(mask_b, dtype=bool)
+    inter = int(np.count_nonzero(a & b))
+    union = int(np.count_nonzero(a | b))
+    if union == 0:
+        return 1.0
+    return float(inter) / float(union)
+
+
+def rbf_kernel_matrix(Xa: np.ndarray, Xb: np.ndarray, length_scale: float) -> np.ndarray:
+    a = np.asarray(Xa, dtype=np.float64)
+    b = np.asarray(Xb, dtype=np.float64)
+    diff = a[:, None, :] - b[None, :, :]
+    sqdist = np.sum(diff * diff, axis=2)
+    ls2 = float(max(1e-12, length_scale * length_scale))
+    return np.exp(-0.5 * sqdist / ls2)
+
+
+def normal_pdf(x: np.ndarray) -> np.ndarray:
+    z = np.asarray(x, dtype=np.float64)
+    return np.exp(-0.5 * z * z) / np.sqrt(2.0 * np.pi)
+
+
+def normal_cdf(x: np.ndarray) -> np.ndarray:
+    z = np.asarray(x, dtype=np.float64)
+    return 0.5 * (1.0 + np.vectorize(math.erf)(z / np.sqrt(2.0)))
+
+
+def propose_bayes_opt_candidate(
+    X: np.ndarray,
+    y: np.ndarray,
+    bounds_lo: np.ndarray,
+    bounds_hi: np.ndarray,
+    random_state: np.random.Generator,
+    num_candidates: int = 2048,
+) -> np.ndarray:
+    X_obs = np.asarray(X, dtype=np.float64)
+    y_obs = np.asarray(y, dtype=np.float64).reshape(-1)
+    if X_obs.shape[0] == 0:
+        return random_state.uniform(bounds_lo, bounds_hi)
+
+    span = np.maximum(bounds_hi - bounds_lo, 1e-9)
+    length_scale = float(np.mean(span) * 0.35)
+    noise = 1e-6
+
+    K_xx = rbf_kernel_matrix(X_obs, X_obs, length_scale) + noise * np.eye(X_obs.shape[0], dtype=np.float64)
+    try:
+        K_inv = np.linalg.inv(K_xx)
+    except np.linalg.LinAlgError:
+        return random_state.uniform(bounds_lo, bounds_hi)
+
+    X_cand = random_state.uniform(bounds_lo, bounds_hi, size=(int(num_candidates), X_obs.shape[1]))
+    K_xs = rbf_kernel_matrix(X_obs, X_cand, length_scale)
+    mu = K_xs.T @ (K_inv @ y_obs)
+    var = 1.0 - np.sum(K_xs * (K_inv @ K_xs), axis=0)
+    sigma = np.sqrt(np.maximum(var, 1e-12))
+    best = float(np.max(y_obs))
+    z = (mu - best) / sigma
+    ei = (mu - best) * normal_cdf(z) + sigma * normal_pdf(z)
+    return np.asarray(X_cand[int(np.argmax(ei))], dtype=np.float64)
 
 
 class MujocoHandSim:
@@ -748,6 +895,20 @@ class MujocoHandSim:
         if len(suffix_matches) == 1:
             return suffix_matches[0]
         return None
+
+    def get_body_local_pos(self, body_name: str) -> np.ndarray:
+        resolved = self.resolve_body_name(body_name)
+        if resolved is None:
+            raise KeyError(f'Body/link "{body_name}" not found in model.')
+        bid = self.body_name_to_id[resolved]
+        return np.asarray(self.model.body_pos[bid], dtype=np.float64).copy()
+
+    def set_body_local_pos(self, body_name: str, pos_xyz: np.ndarray) -> None:
+        resolved = self.resolve_body_name(body_name)
+        if resolved is None:
+            raise KeyError(f'Body/link "{body_name}" not found in model.')
+        bid = self.body_name_to_id[resolved]
+        self.model.body_pos[bid] = np.asarray(pos_xyz, dtype=np.float64).reshape(3)
 
     def _set_camera_from_extrinsic(
         self,
@@ -1051,6 +1212,389 @@ def draw_body_frame_overlay(
     return np.asarray(pil_img, dtype=np.uint8)
 
 
+def load_episode_sequences(
+    ann: Dict[str, object],
+    ep_id: int,
+    ann_path: Path,
+    args: argparse.Namespace,
+) -> Tuple[str, np.ndarray, np.ndarray, int]:
+    joint_key = (
+        "action.hand_joint_position"
+        if args.hand_joint_source == "action"
+        else "observation.state.hand_joint_position"
+    )
+    if joint_key not in ann:
+        fallback_key = (
+            "observation.state.hand_joint_position"
+            if joint_key == "action.hand_joint_position"
+            else "action.hand_joint_position"
+        )
+        if fallback_key in ann:
+            print(f"[warning][episode {ep_id}] Missing {joint_key}; using {fallback_key} instead.")
+            joint_key = fallback_key
+        else:
+            raise KeyError(
+                f"[episode {ep_id}] Missing joint sequence key {joint_key} and fallback {fallback_key}"
+            )
+
+    if args.palm_pose_key not in ann:
+        raise KeyError(
+            f"[episode {ep_id}] Missing end-effector pose key {args.palm_pose_key} in {ann_path}"
+        )
+
+    joint_seq = np.asarray(ann[joint_key], dtype=np.float64)
+    ee_pose_seq = np.asarray(ann[args.palm_pose_key], dtype=np.float64)
+    if joint_seq.ndim != 2 or ee_pose_seq.ndim != 2:
+        raise ValueError(
+            f"[episode {ep_id}] Expected 2D sequences, got joint={joint_seq.shape}, ee_pose={ee_pose_seq.shape}"
+        )
+
+    frame_count = min(joint_seq.shape[0], ee_pose_seq.shape[0])
+    if args.max_frames_per_episode is not None and args.max_frames_per_episode > 0:
+        frame_count = min(frame_count, int(args.max_frames_per_episode))
+    return joint_key, joint_seq, ee_pose_seq, frame_count
+
+
+def build_episode_camera_targets(
+    args: argparse.Namespace,
+    ep_id: int,
+    ann: Dict[str, object],
+    dataset_base_dir: Path,
+    calibration_map: Dict[str, Calibration],
+    render_camera_names: List[str],
+) -> List[DatasetCameraTarget]:
+    episode_out = args.output_dir / str(ep_id)
+    episode_out.mkdir(parents=True, exist_ok=True)
+
+    camera_targets: List[DatasetCameraTarget] = []
+    for render_camera_name in render_camera_names:
+        view_index = CAMERA_TO_VIDEO_INDEX.get(render_camera_name, -1)
+        episode_seg_video_path: Optional[Path] = None
+        if view_index >= 0:
+            episode_seg_video_path = resolve_segmentation_video_path(
+                annotation_data=ann,
+                dataset_base_dir=dataset_base_dir,
+                view_index=view_index,
+            )
+            if episode_seg_video_path is None:
+                fallback_seg = dataset_base_dir / "segmentation_videos" / str(ep_id) / f"{view_index}.mp4"
+                if fallback_seg.exists():
+                    episode_seg_video_path = fallback_seg.resolve()
+
+        dataset_video_size = (
+            probe_video_frame_size(episode_seg_video_path)
+            if episode_seg_video_path is not None
+            else None
+        )
+        output_video_width = (
+            int(dataset_video_size[0]) if dataset_video_size is not None else int(args.width)
+        )
+        output_video_height = (
+            int(dataset_video_size[1]) if dataset_video_size is not None else int(args.height)
+        )
+
+        camera_episode_out = episode_out / render_camera_name
+        label_map_dir = camera_episode_out / "label_map"
+        per_finger_base_dir = camera_episode_out / "finger_masks"
+        camera_episode_out.mkdir(parents=True, exist_ok=True)
+        label_map_dir.mkdir(parents=True, exist_ok=True)
+        if args.save_per_finger_masks:
+            per_finger_base_dir.mkdir(parents=True, exist_ok=True)
+            for finger in FINGER_ORDER:
+                (per_finger_base_dir / finger).mkdir(parents=True, exist_ok=True)
+
+        camera_targets.append(
+            DatasetCameraTarget(
+                camera_name=render_camera_name,
+                calib=calibration_map[render_camera_name],
+                mode=resolve_camera_mode(render_camera_name, args.camera_mode),
+                ee_offset=np.zeros(3, dtype=np.float64),
+                real_seg_video_path=episode_seg_video_path,
+                view_index=view_index,
+                output_video_width=output_video_width,
+                output_video_height=output_video_height,
+                episode_out=camera_episode_out,
+                rgb_video_path=camera_episode_out / "rgb.mp4",
+                hand_mask_video_path=camera_episode_out / "hand_mask.mp4",
+                label_map_dir=label_map_dir,
+                per_finger_base_dir=per_finger_base_dir,
+                lines_path=camera_episode_out / "fingertips_and_pose.jsonl",
+            )
+        )
+    return camera_targets
+
+
+def build_reference_world_points(
+    sim: MujocoHandSim,
+    ee_link: str,
+    specs: List[FingertipSpec],
+) -> np.ndarray:
+    points_world: List[np.ndarray] = []
+    resolved_ee_link = sim.resolve_body_name(ee_link)
+    if resolved_ee_link is not None:
+        T_world_ee = sim.world_link_transform(resolved_ee_link)
+        points_world.append(T_world_ee[:3, 3].copy())
+    for spec in specs:
+        T_world_link = sim.world_link_transform(spec.position_link)
+        tip_world = T_world_link[:3, 3] + T_world_link[:3, :3] @ spec.local_offset_xyz
+        points_world.append(tip_world)
+    return np.asarray(points_world, dtype=np.float64)
+
+
+def choose_camera_extrinsic(
+    args: argparse.Namespace,
+    sim: MujocoHandSim,
+    target: DatasetCameraTarget,
+    ee_link: str,
+    points_world: np.ndarray,
+) -> Tuple[np.ndarray, str]:
+    extrinsic_raw = np.asarray(target.calib.extrinsic, dtype=np.float64)
+    if args.invert_extrinsic:
+        return np.linalg.inv(extrinsic_raw), "forced_inverse"
+    if args.disable_auto_extrinsic_direction:
+        return extrinsic_raw, "forced_raw"
+
+    raw_in, raw_vis, _ = score_extrinsic_direction_for_pose(
+        mode=target.mode,
+        extrinsic=extrinsic_raw,
+        sim=sim,
+        ee_link=resolve_camera_reference_link(target.camera_name, ee_link),
+        ee_offset=target.ee_offset,
+        points_world=points_world,
+        K=target.calib.K,
+        width=args.width,
+        height=args.height,
+    )
+    inv_extrinsic = np.linalg.inv(extrinsic_raw)
+    inv_in, inv_vis, _ = score_extrinsic_direction_for_pose(
+        mode=target.mode,
+        extrinsic=inv_extrinsic,
+        sim=sim,
+        ee_link=resolve_camera_reference_link(target.camera_name, ee_link),
+        ee_offset=target.ee_offset,
+        points_world=points_world,
+        K=target.calib.K,
+        width=args.width,
+        height=args.height,
+    )
+    if raw_in > inv_in or (raw_in == inv_in and raw_vis >= inv_vis):
+        return extrinsic_raw, f"auto_raw(in_frame={raw_in},visible={raw_vis})"
+    return inv_extrinsic, f"auto_inverse(in_frame={inv_in},visible={inv_vis})"
+
+
+def prepare_optimization_episode_data(
+    args: argparse.Namespace,
+    ep_id: int,
+    ann_path: Path,
+    ann: Dict[str, object],
+    dataset_base_dir: Path,
+    calibration_map: Dict[str, Calibration],
+    render_camera_names: List[str],
+) -> OptimizationEpisodeData:
+    joint_key, joint_seq, ee_pose_seq, frame_count = load_episode_sequences(
+        ann=ann,
+        ep_id=ep_id,
+        ann_path=ann_path,
+        args=args,
+    )
+    if frame_count <= 0:
+        raise RuntimeError(f"[episode {ep_id}] No frames available for optimization.")
+
+    camera_targets = build_episode_camera_targets(
+        args=args,
+        ep_id=ep_id,
+        ann=ann,
+        dataset_base_dir=dataset_base_dir,
+        calibration_map=calibration_map,
+        render_camera_names=render_camera_names,
+    )
+    if len(camera_targets) < 1:
+        raise RuntimeError(
+            "Body-position optimization requires at least one camera view to be available."
+        )
+
+    real_masks_by_camera: Dict[str, Dict[int, np.ndarray]] = {}
+    max_shared_frames = int(frame_count)
+    for target in camera_targets:
+        if target.real_seg_video_path is None:
+            raise FileNotFoundError(
+                f"[episode {ep_id}][{target.camera_name}] Missing real segmentation video."
+            )
+        frames = load_video_frames_mediapy(target.real_seg_video_path)
+        masks = [extract_green_hand_mask(frame) for frame in frames]
+        max_shared_frames = min(max_shared_frames, len(masks))
+        real_masks_by_camera[target.camera_name] = {
+            idx: np.asarray(mask, dtype=bool) for idx, mask in enumerate(masks)
+        }
+
+    frame_indices = sample_frame_indices(
+        frame_count=max_shared_frames,
+        stride=int(args.ee_link_offset_frame_stride),
+        max_frames=int(args.ee_link_offset_max_frames),
+    )
+    if not frame_indices:
+        raise RuntimeError(f"[episode {ep_id}] No optimization frames selected.")
+
+    return OptimizationEpisodeData(
+        ep_id=ep_id,
+        ann_path=ann_path,
+        joint_key=joint_key,
+        joint_seq=joint_seq,
+        ee_pose_seq=ee_pose_seq,
+        frame_count=frame_count,
+        frame_indices=frame_indices,
+        real_masks_by_camera=real_masks_by_camera,
+        camera_targets=camera_targets,
+    )
+
+
+def evaluate_body_local_pos_candidate(
+    sim: MujocoHandSim,
+    args: argparse.Namespace,
+    specs: List[FingertipSpec],
+    hand_body_ids: set[int],
+    optimization_episodes: List[OptimizationEpisodeData],
+    body_name: str,
+    candidate_local_pos: np.ndarray,
+) -> float:
+    sim.set_body_local_pos(body_name, candidate_local_pos)
+    total_iou = 0.0
+    total_count = 0
+
+    for episode in optimization_episodes:
+        zero_joint_values = np.zeros_like(episode.joint_seq[0], dtype=np.float64)
+
+        def joint_values_for_frame(frame_idx: int) -> np.ndarray:
+            if frame_idx == 0:
+                return zero_joint_values
+            return np.asarray(episode.joint_seq[frame_idx], dtype=np.float64)
+
+        sim.reset_pose()
+        sim.apply_joint_vector(joint_values_for_frame(0), HAND_JOINT_ORDER)
+        apply_end_effector_pose_to_ee_link(
+            sim,
+            args.ee_link,
+            episode.ee_pose_seq[0],
+            episode.camera_targets[0].ee_offset,
+        )
+        sim.forward()
+
+        points_world = build_reference_world_points(sim, args.ee_link, specs)
+        chosen_extrinsics = {
+            target.camera_name: choose_camera_extrinsic(
+                args=args,
+                sim=sim,
+                target=target,
+                ee_link=args.ee_link,
+                points_world=points_world,
+            )[0]
+            for target in episode.camera_targets
+        }
+
+        for frame_idx in episode.frame_indices:
+            sim.apply_joint_vector(joint_values_for_frame(frame_idx), HAND_JOINT_ORDER)
+            apply_end_effector_pose_to_ee_link(
+                sim,
+                args.ee_link,
+                episode.ee_pose_seq[frame_idx],
+                episode.camera_targets[0].ee_offset,
+            )
+            sim.forward()
+
+            for target in episode.camera_targets:
+                T_world_camera = compute_world_camera_transform(
+                    mode=target.mode,
+                    extrinsic=np.asarray(chosen_extrinsics[target.camera_name], dtype=np.float64),
+                    sim=sim,
+                    ee_link=resolve_camera_reference_link(target.camera_name, args.ee_link),
+                    ee_offset=target.ee_offset,
+                )
+                camera_state = CameraState(
+                    kind="calibrated",
+                    calibration_camera_name=target.camera_name,
+                    T_world_camera=T_world_camera,
+                    K=target.calib.K,
+                )
+                _, geom_ids = sim.render_rgb_and_seg(camera_state=camera_state)
+                hand_mask, _, _ = decode_hand_segmentation_from_geom_ids(
+                    geom_ids,
+                    sim.model,
+                    hand_body_ids,
+                )
+                sim_mask = downscale_sim_mask_for_segmentation_video(hand_mask)
+                real_mask = episode.real_masks_by_camera[target.camera_name][frame_idx]
+                total_iou += mask_iou(sim_mask, real_mask)
+                total_count += 1
+
+    if total_count <= 0:
+        raise RuntimeError("No camera/frame pairs were evaluated during body-position optimization.")
+    return float(total_iou) / float(total_count)
+
+
+def optimize_body_local_position(
+    sim: MujocoHandSim,
+    args: argparse.Namespace,
+    specs: List[FingertipSpec],
+    hand_body_ids: set[int],
+    optimization_episodes: List[OptimizationEpisodeData],
+    body_name: str,
+    log_name: str,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    base_local_pos = sim.get_body_local_pos(body_name)
+    search_range = float(max(1e-5, args.ee_link_offset_search_range))
+    bounds_lo = -np.full((3,), search_range, dtype=np.float64)
+    bounds_hi = np.full((3,), search_range, dtype=np.float64)
+    total_evals = int(max(1, args.ee_link_offset_bayes_iters))
+    init_evals = int(max(1, min(args.ee_link_offset_bayes_init, total_evals)))
+
+    rng = np.random.default_rng(0)
+    X_list: List[np.ndarray] = []
+    y_list: List[float] = []
+
+    for eval_idx in range(total_evals):
+        if eval_idx == 0:
+            delta = np.zeros((3,), dtype=np.float64)
+        elif eval_idx < init_evals:
+            delta = rng.uniform(bounds_lo, bounds_hi)
+        else:
+            delta = propose_bayes_opt_candidate(
+                X=np.asarray(X_list, dtype=np.float64),
+                y=np.asarray(y_list, dtype=np.float64),
+                bounds_lo=bounds_lo,
+                bounds_hi=bounds_hi,
+                random_state=rng,
+            )
+
+        candidate_local_pos = base_local_pos + np.asarray(delta, dtype=np.float64)
+        score = evaluate_body_local_pos_candidate(
+            sim=sim,
+            args=args,
+            specs=specs,
+            hand_body_ids=hand_body_ids,
+            optimization_episodes=optimization_episodes,
+            body_name=body_name,
+            candidate_local_pos=candidate_local_pos,
+        )
+        X_list.append(np.asarray(delta, dtype=np.float64))
+        y_list.append(float(score))
+        print(
+            f"[optimize][{log_name}] eval={eval_idx + 1}/{total_evals} "
+            f"delta={np.asarray(delta, dtype=np.float64).tolist()} mean_iou={score:.6f}"
+        )
+
+    best_idx = int(np.argmax(np.asarray(y_list, dtype=np.float64)))
+    best_delta = np.asarray(X_list[best_idx], dtype=np.float64)
+    best_local_pos = base_local_pos + best_delta
+    best_score = float(y_list[best_idx])
+    sim.set_body_local_pos(body_name, best_local_pos)
+    sim.reset_pose()
+    print(
+        f"[optimize][{log_name}] best_local_pos={best_local_pos.tolist()} "
+        f"best_delta={best_delta.tolist()} mean_iou={best_score:.6f}"
+    )
+    return best_local_pos, best_delta, best_score
+
+
 def run_dataset_mode(args: argparse.Namespace) -> None:
     if args.dataset_root is None and args.annotation_dir is None:
         raise ValueError("Dataset mode requires --dataset-root or --annotation-dir.")
@@ -1106,6 +1650,47 @@ def run_dataset_mode(args: argparse.Namespace) -> None:
             if name in sim.body_name_to_id
         }
         hand_body_ids = set(sim.body_name_to_id.values()) - excluded_body_ids
+
+        if args.optimize_ee_link_offset:
+            stage_camera_specs = [
+                ("ee_link", args.ee_link, [EE_LINK_OPTIMIZATION_CAMERA]),
+                ("hand_mount", HAND_MOUNT_BODY_NAME, [HAND_MOUNT_OPTIMIZATION_CAMERA]),
+            ]
+            for stage_name, body_name, optimization_camera_names in stage_camera_specs:
+                missing = [name for name in optimization_camera_names if name not in calibration_map]
+                if missing:
+                    raise RuntimeError(
+                        f"Missing calibration for optimization stage {stage_name}: required cameras {missing}"
+                    )
+                optimization_episodes: List[OptimizationEpisodeData] = []
+                print(
+                    f"[optimize][{stage_name}] preparing episodes using cameras={optimization_camera_names}"
+                )
+                for ep_id in selected_ids:
+                    ann_path = files_by_id[ep_id]
+                    with ann_path.open("r", encoding="utf-8") as f:
+                        ann = json.load(f)
+                    optimization_episodes.append(
+                        prepare_optimization_episode_data(
+                            args=args,
+                            ep_id=ep_id,
+                            ann_path=ann_path,
+                            ann=ann,
+                            dataset_base_dir=dataset_base_dir,
+                            calibration_map=calibration_map,
+                            render_camera_names=optimization_camera_names,
+                        )
+                    )
+
+                optimize_body_local_position(
+                    sim=sim,
+                    args=args,
+                    specs=specs,
+                    hand_body_ids=hand_body_ids,
+                    optimization_episodes=optimization_episodes,
+                    body_name=body_name,
+                    log_name=stage_name,
+                )
 
         for ep_id in selected_ids:
             ann_path = files_by_id[ep_id]
@@ -1204,6 +1789,7 @@ def run_dataset_mode(args: argparse.Namespace) -> None:
                         calib=calibration_map[render_camera_name],
                         mode=resolve_camera_mode(render_camera_name, args.camera_mode),
                         ee_offset=np.zeros(3, dtype=np.float64),
+                        real_seg_video_path=episode_seg_video_path,
                         view_index=view_index,
                         output_video_width=output_video_width,
                         output_video_height=output_video_height,
@@ -1399,14 +1985,30 @@ def run_dataset_mode(args: argparse.Namespace) -> None:
                         hand_mask_rgb = np.repeat(hand_mask_vis[:, :, None], 3, axis=2)
                         runtime["hand_mask_video_frames"].append(hand_mask_rgb)
 
-                        Image.fromarray(label_map, mode="L").save(
+                        label_map_out = label_map
+                        if label_map_out.shape != (target.output_video_height, target.output_video_width):
+                            label_map_out = np.asarray(
+                                Image.fromarray(label_map, mode="L").resize(
+                                    (int(target.output_video_width), int(target.output_video_height)),
+                                    resample=Image.NEAREST,
+                                ),
+                                dtype=np.uint8,
+                            )
+                        Image.fromarray(label_map_out, mode="L").save(
                             target.label_map_dir / f"{frame_idx:06d}.png"
                         )
                         if args.save_per_finger_masks:
                             for finger in FINGER_ORDER:
+                                mask_out = per_finger_masks[finger]
+                                if mask_out.shape != (target.output_video_height, target.output_video_width):
+                                    mask_out = _resize_mask_nearest(
+                                        mask_out,
+                                        width=target.output_video_width,
+                                        height=target.output_video_height,
+                                    )
                                 save_mask(
                                     target.per_finger_base_dir / finger / f"{frame_idx:06d}.png",
-                                    per_finger_masks[finger],
+                                    mask_out,
                                 )
 
                         line_obj = {
