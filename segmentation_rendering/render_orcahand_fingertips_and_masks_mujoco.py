@@ -3,11 +3,10 @@
 Render OrcaHand segmentation masks and fingertip end-effector positions via MuJoCo.
 
 Outputs:
-- rgb.png
-- hand_mask.png
-- per-finger binary masks
-- label_map.npy and label_map.png
-- fingertip_positions.json
+- dataset-mode RGB videos
+- dataset-mode hand mask videos
+- per-frame label maps
+- fingertip positions JSONL
 """
 
 from __future__ import annotations
@@ -16,15 +15,19 @@ import argparse
 import json
 import os
 import pickle
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
-# Prefer headless EGL backend when DISPLAY is unavailable.
-os.environ.setdefault("MUJOCO_GL", "egl")
+# Prefer an onscreen backend when a display server is available.
+if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+    os.environ.setdefault("MUJOCO_GL", "glfw")
+else:
+    os.environ.setdefault("MUJOCO_GL", "egl")
 
 try:
     import mujoco
@@ -33,6 +36,14 @@ except Exception as exc:  # pragma: no cover
     MUJOCO_IMPORT_ERROR = exc
 else:
     MUJOCO_IMPORT_ERROR = None
+
+try:
+    import mujoco.viewer as mujoco_viewer
+except Exception as exc:  # pragma: no cover
+    mujoco_viewer = None
+    MUJOCO_VIEWER_IMPORT_ERROR = exc
+else:
+    MUJOCO_VIEWER_IMPORT_ERROR = None
 
 try:
     import mediapy as media
@@ -52,12 +63,13 @@ else:
 
 
 DEFAULT_MODEL_PATH = Path(
-    "/data/sam3_based_labeling_pipeline/assets/orcahand_v1b/orcahand.xml"
+    # "/data/sam3_based_labeling_pipeline/assets/orcahand_v1b/orcahand.xml"
+    "assets/orcahand_v1b/orcahand.xml"
 )
-DEFAULT_CALIBRATION_DIR = Path("/data/sam3_based_labeling_pipeline/assets/calibration_params")
-DEFAULT_OUTPUT_DIR = Path("/data/sam3_based_labeling_pipeline/segmentation_rendering/output")
+DEFAULT_CALIBRATION_DIR = Path("assets/calibration_params")
+DEFAULT_OUTPUT_DIR = Path("output_mujoco")
 DEFAULT_DATASET_ROOT = Path(
-    "/data/Ctrl-World/datasets/2026-03-14T13-34-49/large_real_dataset_5fps_135_240"
+    "assets/test_dataset"
 )
 
 VIDEO_INDEX_TO_CAMERA = {
@@ -70,19 +82,17 @@ CAMERA_EXTRINSIC_MODE = {
     "oakd_side_view": "base_camera",
     "oakd_wrist_view": "ee_camera",
 }
+CALIB_CAMERA_TO_XML_CAMERA = {
+    "oakd_side_view": "third_view_camera",
+    "oakd_wrist_view": "wrist_view_camera",
+}
+CAMERA_REFERENCE_LINK = {
+    "oakd_wrist_view": "hand_mount",
+}
+OPENCV_CAMERA_TO_MUJOCO_CAMERA_ROT = np.diag([1.0, -1.0, -1.0]).astype(np.float64)
 
 FINGER_ORDER = ("thumb", "index", "middle", "ring", "pinky")
 FINGER_LABEL_ID = {name: idx + 1 for idx, name in enumerate(FINGER_ORDER)}
-
-DEFAULT_EE_TRANSLATION_OFFSET = np.array([0.0, 0.0, 0.0], dtype=np.float64)
-CALIB_TO_SIM_AXIS_SWAP = np.array(
-    [
-        [0.0, 1.0, 0.0],  # x_calib = y_sim  -> x_sim = y_calib
-        [1.0, 0.0, 0.0],  # y_calib = x_sim  -> y_sim = x_calib
-        [0.0, 0.0, 1.0],  # z_calib = z_sim
-    ],
-    dtype=np.float64,
-)
 
 FALLBACK_TIP_SPECS = {
     "thumb": ("thumb_dp", np.array([0.0, 0.0, 0.03], dtype=np.float64)),
@@ -131,8 +141,26 @@ class FingertipSpec:
 @dataclass
 class CameraState:
     kind: str  # calibrated
+    calibration_camera_name: Optional[str]
     T_world_camera: Optional[np.ndarray]
     K: Optional[np.ndarray]
+
+
+@dataclass
+class DatasetCameraTarget:
+    camera_name: str
+    calib: Calibration
+    mode: str
+    ee_offset: np.ndarray
+    view_index: int
+    output_video_width: int
+    output_video_height: int
+    episode_out: Path
+    rgb_video_path: Path
+    hand_mask_video_path: Path
+    label_map_dir: Path
+    per_finger_base_dir: Path
+    lines_path: Path
 
 
 def parse_args() -> argparse.Namespace:
@@ -217,40 +245,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ee-link",
         type=str,
-        default="root",
+        default="ee_link",
         help="Link used as EE frame when camera-mode is ee_camera.",
-    )
-    parser.add_argument(
-        "--ee-translation-offset",
-        type=float,
-        nargs=3,
-        default=None,
-        help=(
-            "Override EE translation offset. If omitted, uses DEFAULT_EE_TRANSLATION_OFFSET."
-        ),
-    )
-    parser.add_argument(
-        "--hand-root-extra-rot-deg",
-        type=float,
-        nargs=3,
-        default=[0.0, 0.0, 0.0],
-        help="Extra local XYZ rotation (degrees) applied at hand root after EE orientation.",
     )
     parser.add_argument("--width", type=int, default=960)
     parser.add_argument("--height", type=int, default=540)
     parser.add_argument("--near", type=float, default=0.01)
     parser.add_argument("--far", type=float, default=3.0)
-    parser.add_argument(
-        "--joint-positions",
-        type=str,
-        default="",
-        help='Comma-separated overrides, e.g. "joint_palm=0.2,joint_pip_index=0.5".',
-    )
-    parser.add_argument(
-        "--save-rgb",
-        action="store_true",
-        help="Also save rendered RGB image.",
-    )
     parser.add_argument(
         "--no-hand-root-frame-overlay",
         action="store_true",
@@ -259,7 +260,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hand-root-frame-axis-length",
         type=float,
-        default=0.05,
+        default=0.1,
         help="Axis length (meters) for MuJoCo-rendered body coordinate frames.",
     )
     parser.add_argument(
@@ -276,7 +277,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--disable-auto-extrinsic-direction",
         action="store_true",
-        help="Disable raw/inverse extrinsic direction scoring like final_extract_segmentation_masks.py.",
+        default=True,
+        help=(
+            "Use raw extrinsic from calibration without heuristic inversion scoring. "
+            "Default ON because the calibration stores mnt_T_cam (camera-in-mount frame), "
+            "so the raw matrix is always the correct T_world_camera / T_ee_camera."
+        ),
+    )
+    parser.add_argument(
+        "--auto-extrinsic-direction",
+        dest="disable_auto_extrinsic_direction",
+        action="store_false",
+        help="Re-enable heuristic raw/inverse extrinsic direction scoring (not recommended).",
+    )
+    parser.add_argument(
+        "--show-viewer",
+        action="store_true",
+        help="Open an onscreen MuJoCo viewer window for debugging.",
     )
     return parser.parse_args()
 
@@ -313,10 +330,7 @@ def rot_to_quat_xyzw(R: np.ndarray) -> np.ndarray:
 
 
 def convert_transform_calib_to_sim(T_calib: np.ndarray) -> np.ndarray:
-    T_in = np.asarray(T_calib, dtype=np.float64).reshape(4, 4)
-    X = np.eye(4, dtype=np.float64)
-    X[:3, :3] = CALIB_TO_SIM_AXIS_SWAP
-    return X @ T_in @ X.T
+    return np.asarray(T_calib, dtype=np.float64).reshape(4, 4).copy()
 
 
 def convert_pose_xyz_rpy_calib_to_sim(pose_xyz_rpy: np.ndarray) -> np.ndarray:
@@ -325,23 +339,7 @@ def convert_pose_xyz_rpy_calib_to_sim(pose_xyz_rpy: np.ndarray) -> np.ndarray:
         raise ValueError(
             f"Expected end-effector pose with 6 values [x,y,z,roll,pitch,yaw], got shape {arr.shape}"
         )
-    t_calib = arr[:3]
-    q_calib = euler_xyz_to_quat_xyzw(float(arr[3]), float(arr[4]), float(arr[5]))
-    R_calib = quat_xyzw_to_rot(q_calib)
-
-    S = CALIB_TO_SIM_AXIS_SWAP
-    t_sim = S @ t_calib
-    R_sim = S @ R_calib @ S.T
-    q_sim = rot_to_quat_xyzw(R_sim)
-    T_sim = matrix_from_pose(t_sim, q_sim)
-
-    out = arr.copy()
-    out[:3] = T_sim[:3, 3]
-    assert SciRotation is not None
-    out[3:6] = SciRotation.from_matrix(T_sim[:3, :3]).as_euler("xyz", degrees=False).astype(
-        np.float64
-    )
-    return out
+    return arr.copy()
 
 
 def load_calibration_map(calibration_dir: Path) -> Dict[str, Calibration]:
@@ -375,34 +373,12 @@ def load_calibration_map(calibration_dir: Path) -> Dict[str, Calibration]:
             if not isinstance(pair, (tuple, list)) or len(pair) < 1:
                 continue
             K = np.asarray(pair[0], dtype=np.float64)
-            dist = np.zeros((5,), dtype=np.float64)
+            dist = np.asarray(pair[1], dtype=np.float64) if len(pair) >= 2 else np.zeros((5,), dtype=np.float64)
             out[cam_name] = Calibration(K=K, dist=dist, extrinsic=extr_map[cam_name])
 
     if not out:
         raise RuntimeError(f"No valid calibration loaded from {calibration_dir}")
     return out
-
-
-def parse_joint_overrides(raw: str) -> Dict[str, float]:
-    out: Dict[str, float] = {}
-    text = raw.strip()
-    if not text:
-        return out
-    for token in text.split(","):
-        token = token.strip()
-        if not token:
-            continue
-        if "=" not in token:
-            raise ValueError(f'Invalid joint override "{token}". Use "joint_name=value".')
-        name, value = token.split("=", 1)
-        out[name.strip()] = float(value.strip())
-    return out
-
-
-def load_joint_overrides(args: argparse.Namespace) -> Dict[str, float]:
-    overrides: Dict[str, float] = {}
-    overrides.update(parse_joint_overrides(args.joint_positions))
-    return overrides
 
 
 def build_fingertip_specs(
@@ -439,42 +415,41 @@ def pick_camera_name(args: argparse.Namespace) -> str:
     return VIDEO_INDEX_TO_CAMERA[args.camera_index]
 
 
+def resolve_dataset_camera_names(
+    args: argparse.Namespace, calibration_map: Dict[str, Calibration]
+) -> List[str]:
+    preferred = [VIDEO_INDEX_TO_CAMERA[idx] for idx in sorted(VIDEO_INDEX_TO_CAMERA)]
+    available = [name for name in preferred if name in calibration_map]
+    if len(available) >= 2:
+        return available
+    selected = pick_camera_name(args)
+    if selected not in calibration_map:
+        raise KeyError(
+            f'Camera "{selected}" not found in calibration. '
+            f"Available: {sorted(calibration_map.keys())}"
+        )
+    return [selected]
+
+
 def resolve_camera_mode(camera_name: str, mode_arg: str) -> str:
     if mode_arg != "auto":
         return mode_arg
     return CAMERA_EXTRINSIC_MODE.get(camera_name, "base_camera")
 
 
-def resolve_ee_translation_offset(
-    camera_name: str, override_xyz: Optional[Iterable[float]]
-) -> np.ndarray:
-    _ = camera_name
-    if override_xyz is not None:
-        return np.asarray(list(override_xyz), dtype=np.float64).reshape(3)
-    return DEFAULT_EE_TRANSLATION_OFFSET.copy()
+def resolve_camera_reference_link(camera_name: str, default_ee_link: str) -> str:
+    return CAMERA_REFERENCE_LINK.get(camera_name, default_ee_link)
 
 
-def intrinsics_to_opengl_projection(
-    K: np.ndarray,
-    width: int,
-    height: int,
-    near: float,
-    far: float,
-) -> List[float]:
-    fx = float(K[0, 0])
-    fy = float(K[1, 1])
-    cx = float(K[0, 2])
-    cy = float(K[1, 2])
-    proj = np.array(
-        [
-            [2.0 * fx / width, 0.0, (width - 2.0 * cx) / width, 0.0],
-            [0.0, 2.0 * fy / height, (2.0 * cy - height) / height, 0.0],
-            [0.0, 0.0, (near + far) / (near - far), 2.0 * near * far / (near - far)],
-            [0.0, 0.0, -1.0, 0.0],
-        ],
-        dtype=np.float64,
-    )
-    return proj.T.reshape(16).tolist()
+def convert_world_camera_transform_opencv_to_mujoco(T_world_camera: np.ndarray) -> np.ndarray:
+    T_in = np.asarray(T_world_camera, dtype=np.float64).reshape(4, 4)
+    T_out = T_in.copy()
+    # OpenCV camera axes are x-right, y-down, z-forward, while MuJoCo cameras
+    # follow the OpenGL convention x-right, y-up, z-back. Rotate the camera
+    # frame 180 degrees around its local x-axis so the rendered view matches
+    # the calibration extrinsics while keeping the camera center fixed.
+    T_out[:3, :3] = T_in[:3, :3] @ OPENCV_CAMERA_TO_MUJOCO_CAMERA_ROT
+    return T_out
 
 
 def project_point_camera(
@@ -664,12 +639,13 @@ class MujocoHandSim:
 
         for jid in range(self.model.njnt):
             name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, jid)
-            if not name:
-                continue
-            self.joint_name_to_id[name] = jid
             jtype = int(self.model.jnt_type[jid])
             qadr = int(self.model.jnt_qposadr[jid])
+            if name:
+                self.joint_name_to_id[name] = jid
             if jtype in (int(mujoco.mjtJoint.mjJNT_HINGE), int(mujoco.mjtJoint.mjJNT_SLIDE)):
+                if not name:
+                    continue
                 self.joint_name_to_qpos_adr[name] = qadr
             elif jtype == int(mujoco.mjtJoint.mjJNT_FREE) and self.free_joint_qpos_adr is None:
                 self.free_joint_qpos_adr = qadr
@@ -773,22 +749,61 @@ class MujocoHandSim:
             return suffix_matches[0]
         return None
 
-    def _set_camera_from_extrinsic(self, T_world_camera: np.ndarray) -> None:
-        cam_pos = np.asarray(T_world_camera[:3, 3], dtype=np.float64)
-        forward = np.asarray(T_world_camera[:3, 2], dtype=np.float64)
-        dist = 0.35
-        lookat = cam_pos + forward * dist
-        offset = cam_pos - lookat
-        xy = float(np.linalg.norm(offset[:2]))
-        azimuth = float(np.degrees(np.arctan2(offset[1], offset[0])))
-        elevation = float(np.degrees(np.arctan2(offset[2], max(1e-9, xy))))
-        self._camera.type = int(mujoco.mjtCamera.mjCAMERA_FREE)
-        self._camera.fixedcamid = -1
+    def _set_camera_from_extrinsic(
+        self,
+        calibration_camera_name: str,
+        T_world_camera: np.ndarray,
+        K: Optional[np.ndarray] = None,
+    ) -> None:
+        # Convert ROS/OpenCV camera convention → MuJoCo/OpenGL camera convention.
+        # T_mj is the camera pose in world space with MuJoCo axes (x-right, y-up, z-back).
+        T_mj = convert_world_camera_transform_opencv_to_mujoco(T_world_camera)
+
+        xml_camera_name = CALIB_CAMERA_TO_XML_CAMERA.get(calibration_camera_name, calibration_camera_name)
+        cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, xml_camera_name)
+        if cam_id < 0:
+            raise KeyError(
+                f'Camera "{xml_camera_name}" not found in model for calibration view '
+                f'"{calibration_camera_name}".'
+            )
+
+        # model.cam_pos/quat are in the PARENT BODY's local frame, not world frame.
+        # For cameras parented to a non-world body (e.g. wrist_view_camera inside
+        # the root body), we must transform T_mj into that body's local frame.
+        parent_body_id = int(self.model.cam_bodyid[cam_id])
+        if parent_body_id != 0:  # 0 = worldbody; world frame == local frame
+            T_world_parent = np.eye(4, dtype=np.float64)
+            T_world_parent[:3, :3] = np.asarray(
+                self.data.xmat[parent_body_id], dtype=np.float64
+            ).reshape(3, 3)
+            T_world_parent[:3, 3] = np.asarray(self.data.xpos[parent_body_id], dtype=np.float64)
+            T_local = np.linalg.inv(T_world_parent) @ T_mj
+        else:
+            T_local = T_mj
+
+        assert SciRotation is not None
+        r_local = SciRotation.from_matrix(T_local[:3, :3])
+        q_local = r_local.as_quat()
+        mj_quat_local = np.array([q_local[3], q_local[0], q_local[1], q_local[2]], dtype=np.float64)
+
+        # Update model (local frame) so future mj_forward calls stay consistent.
+        self.model.cam_pos[cam_id] = T_local[:3, 3]
+        self.model.cam_quat[cam_id] = mj_quat_local
+
+        # Also write the world-space values directly into data so the renderer
+        # uses the correct pose without requiring an additional mj_forward call.
+        self.data.cam_xpos[cam_id] = T_mj[:3, 3]
+        self.data.cam_xmat[cam_id] = T_mj[:3, :3].ravel()
+
+        self._camera.type = int(mujoco.mjtCamera.mjCAMERA_FIXED)
+        self._camera.fixedcamid = int(cam_id)
         self._camera.trackbodyid = -1
-        self._camera.lookat[:] = lookat.reshape(3)
-        self._camera.distance = float(dist)
-        self._camera.azimuth = float(azimuth)
-        self._camera.elevation = float(elevation)
+
+        if K is not None and hasattr(self.model, "cam_intrinsic"):
+            self.model.cam_intrinsic[cam_id] = np.array(
+                [K[0, 0], K[1, 1], K[0, 2], K[1, 2]],
+                dtype=np.float64,
+            )
 
     def set_frame_visualization(self, enabled: bool, axis_length_m: float) -> None:
         if enabled:
@@ -798,6 +813,10 @@ class MujocoHandSim:
                 self.model.vis.scale.framelength = axis_len
             except Exception:
                 pass
+            try:
+                self.model.vis.scale.framewidth = max(1e-5, axis_len * 0.2)
+            except Exception:
+                pass
         else:
             self._rgb_scene_option.frame = int(mujoco.mjtFrame.mjFRAME_NONE)
 
@@ -805,9 +824,13 @@ class MujocoHandSim:
         self,
         camera_state: CameraState,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        if camera_state.T_world_camera is None:
+        if camera_state.T_world_camera is None or camera_state.calibration_camera_name is None:
             raise ValueError("Calibrated rendering requires T_world_camera.")
-        self._set_camera_from_extrinsic(camera_state.T_world_camera)
+        self._set_camera_from_extrinsic(
+            camera_state.calibration_camera_name,
+            camera_state.T_world_camera,
+            camera_state.K,
+        )
 
         self.renderer.disable_segmentation_rendering()
         self.renderer.update_scene(
@@ -827,6 +850,26 @@ class MujocoHandSim:
 
         geom_ids = self._extract_geom_ids(seg_raw)
         return rgb, geom_ids
+
+    def sync_viewer(self, viewer: object, camera_state: CameraState) -> None:
+        if camera_state.T_world_camera is None or camera_state.calibration_camera_name is None:
+            return
+        self._set_camera_from_extrinsic(
+            camera_state.calibration_camera_name,
+            camera_state.T_world_camera,
+            camera_state.K,
+        )
+        if hasattr(viewer, "lock"):
+            with viewer.lock():
+                viewer.cam.type = self._camera.type
+                viewer.cam.fixedcamid = self._camera.fixedcamid
+                viewer.cam.trackbodyid = self._camera.trackbodyid
+                viewer.cam.lookat[:] = self._camera.lookat
+                viewer.cam.distance = self._camera.distance
+                viewer.cam.azimuth = self._camera.azimuth
+                viewer.cam.elevation = self._camera.elevation
+                viewer.opt.frame = self._rgb_scene_option.frame
+        viewer.sync()
 
     def _extract_geom_ids(self, seg_raw: np.ndarray) -> np.ndarray:
         arr = np.asarray(seg_raw)
@@ -908,31 +951,46 @@ def decode_hand_segmentation_from_geom_ids(
     return hand_mask, link_idx_map, False
 
 
-def apply_end_effector_pose_to_hand_root(
+def apply_end_effector_pose_to_ee_link(
     sim: MujocoHandSim,
+    ee_link: str,
     target_xyz_rpy: np.ndarray,
     ee_offset_xyz: np.ndarray,
-    hand_root_extra_rot_xyz_rad: np.ndarray,
 ) -> Dict[str, object]:
     arr_raw = np.asarray(target_xyz_rpy, dtype=np.float64).reshape(-1)
     arr = convert_pose_xyz_rpy_calib_to_sim(arr_raw)
 
     assert SciRotation is not None
-    base_rot = SciRotation.from_euler("xyz", arr[3:6], degrees=False)
-    rot_xyz = np.asarray(hand_root_extra_rot_xyz_rad, dtype=np.float64).reshape(3)
-    extra_rot = SciRotation.from_euler("xyz", rot_xyz, degrees=False)
-    R_world_ee = (base_rot * extra_rot).as_matrix().astype(np.float64)
-    base_quat = SciRotation.from_matrix(R_world_ee).as_quat().astype(np.float64)
+    R_world_ee_target = SciRotation.from_euler("xyz", arr[3:6], degrees=False).as_matrix().astype(
+        np.float64
+    )
 
     ee_offset = np.asarray(ee_offset_xyz, dtype=np.float64).reshape(3)
-    base_pos_np = np.asarray(arr[:3], dtype=np.float64) - (R_world_ee @ ee_offset)
+    T_world_ee_target = np.eye(4, dtype=np.float64)
+    T_world_ee_target[:3, :3] = R_world_ee_target
+    T_world_ee_target[:3, 3] = np.asarray(arr[:3], dtype=np.float64)
+
+    resolved_ee_link = sim.resolve_body_name(ee_link)
+    if resolved_ee_link is None:
+        raise KeyError(f'EE link "{ee_link}" could not be resolved to a body in the model.')
+
+    T_world_root_current = sim.world_link_transform("root")
+    T_world_ee_current = sim.world_link_transform(resolved_ee_link)
+    T_root_ee = np.linalg.inv(T_world_root_current) @ T_world_ee_current
+    T_root_ee_adjusted = T_root_ee.copy()
+    T_root_ee_adjusted[:3, 3] = T_root_ee_adjusted[:3, 3] + ee_offset
+
+    T_world_root_target = T_world_ee_target @ np.linalg.inv(T_root_ee_adjusted)
+
+    base_quat = SciRotation.from_matrix(T_world_root_target[:3, :3]).as_quat().astype(np.float64)
+    base_pos_np = np.asarray(T_world_root_target[:3, 3], dtype=np.float64)
     sim.set_base_pose(base_pos_np, base_quat)
 
     return {
+        "ee_link": resolved_ee_link,
         "target_ee_xyz_rpy_input_calib": arr_raw[:6].tolist(),
         "target_ee_xyz_rpy_used_sim": arr[:6].tolist(),
         "ee_offset_xyz": ee_offset.tolist(),
-        "hand_root_extra_rot_xyz_rad": rot_xyz.tolist(),
         "applied_base_position": base_pos_np.tolist(),
         "applied_base_quaternion_xyzw": base_quat.tolist(),
     }
@@ -944,6 +1002,53 @@ def _project_tip_for_camera(
     K: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
     return project_point_camera(tip_world, T_world_camera, K)
+
+
+def draw_body_frame_overlay(
+    rgb: np.ndarray,
+    T_world_body: np.ndarray,
+    T_world_camera: np.ndarray,
+    K: np.ndarray,
+    axis_length_m: float,
+    origin_fill_rgb: Tuple[int, int, int] = (255, 255, 255),
+    origin_outline_rgb: Tuple[int, int, int] = (0, 0, 0),
+) -> np.ndarray:
+    origin = np.asarray(T_world_body[:3, 3], dtype=np.float64)
+    rot = np.asarray(T_world_body[:3, :3], dtype=np.float64).reshape(3, 3)
+    axes = (
+        ("x", np.array([255, 64, 64], dtype=np.uint8)),
+        ("y", np.array([64, 220, 64], dtype=np.uint8)),
+        ("z", np.array([64, 128, 255], dtype=np.uint8)),
+    )
+
+    origin_cam, origin_px = project_point_camera(origin, T_world_camera, K)
+    if float(origin_cam[2]) <= 1e-9:
+        return rgb
+
+    pil_img = Image.fromarray(rgb)
+    draw = ImageDraw.Draw(pil_img)
+    origin_xy = (float(origin_px[0]), float(origin_px[1]))
+    radius = 4
+
+    for axis_idx, (_, color) in enumerate(axes):
+        endpoint = origin + rot[:, axis_idx] * float(axis_length_m)
+        endpoint_cam, endpoint_px = project_point_camera(endpoint, T_world_camera, K)
+        if float(endpoint_cam[2]) <= 1e-9:
+            continue
+        endpoint_xy = (float(endpoint_px[0]), float(endpoint_px[1]))
+        draw.line([origin_xy, endpoint_xy], fill=tuple(int(v) for v in color), width=4)
+
+    draw.ellipse(
+        [
+            origin_xy[0] - radius,
+            origin_xy[1] - radius,
+            origin_xy[0] + radius,
+            origin_xy[1] + radius,
+        ],
+        fill=origin_fill_rgb,
+        outline=origin_outline_rgb,
+    )
+    return np.asarray(pil_img, dtype=np.uint8)
 
 
 def run_dataset_mode(args: argparse.Namespace) -> None:
@@ -975,23 +1080,21 @@ def run_dataset_mode(args: argparse.Namespace) -> None:
     if not selected_ids:
         raise RuntimeError("No matching episode ids selected.")
 
-    camera_name = pick_camera_name(args)
-    resolved_ee_offset_default = resolve_ee_translation_offset(
-        camera_name=camera_name, override_xyz=args.ee_translation_offset
-    )
-
     calibration_map = load_calibration_map(args.calibration_dir)
-    if camera_name not in calibration_map:
-        raise KeyError(
-            f'Camera "{camera_name}" not found in calibration. '
-            f"Available: {sorted(calibration_map.keys())}"
-        )
-    calib = calibration_map[camera_name]
+    render_camera_names = resolve_dataset_camera_names(args, calibration_map)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     sim = MujocoHandSim(args.model_path, width=args.width, height=args.height)
+    viewer = None
     try:
+        if args.show_viewer:
+            if mujoco_viewer is None:
+                raise ImportError(
+                    "mujoco.viewer is required for --show-viewer. "
+                    f"Import error: {MUJOCO_VIEWER_IMPORT_ERROR}"
+                )
+            viewer = mujoco_viewer.launch_passive(sim.model, sim.data)
         sim.set_frame_visualization(
             enabled=bool(not args.no_hand_root_frame_overlay),
             axis_length_m=float(args.hand_root_frame_axis_length),
@@ -1004,37 +1107,10 @@ def run_dataset_mode(args: argparse.Namespace) -> None:
         }
         hand_body_ids = set(sim.body_name_to_id.values()) - excluded_body_ids
 
-        mode = resolve_camera_mode(camera_name, args.camera_mode)
-
         for ep_id in selected_ids:
             ann_path = files_by_id[ep_id]
             with ann_path.open("r", encoding="utf-8") as f:
                 ann = json.load(f)
-
-            if args.camera_index is not None:
-                view_index = int(args.camera_index)
-            else:
-                view_index = CAMERA_TO_VIDEO_INDEX.get(camera_name, -1)
-
-            episode_seg_video_path: Optional[Path] = None
-            if view_index >= 0:
-                episode_seg_video_path = resolve_segmentation_video_path(
-                    annotation_data=ann,
-                    dataset_base_dir=dataset_base_dir,
-                    view_index=view_index,
-                )
-                if episode_seg_video_path is None:
-                    fallback_seg = dataset_base_dir / "segmentation_videos" / str(ep_id) / f"{view_index}.mp4"
-                    if fallback_seg.exists():
-                        episode_seg_video_path = fallback_seg.resolve()
-
-            dataset_video_size = (
-                probe_video_frame_size(episode_seg_video_path)
-                if episode_seg_video_path is not None
-                else None
-            )
-            output_video_width = int(dataset_video_size[0]) if dataset_video_size is not None else int(args.width)
-            output_video_height = int(dataset_video_size[1]) if dataset_video_size is not None else int(args.height)
 
             joint_key = (
                 "action.hand_joint_position"
@@ -1081,248 +1157,297 @@ def run_dataset_mode(args: argparse.Namespace) -> None:
                 print(f"[warning][episode {ep_id}] No frames to render; skipping.")
                 continue
 
-            episode_ee_offset = np.asarray(resolved_ee_offset_default, dtype=np.float64).reshape(3).copy()
-            episode_root_rot_deg = np.asarray(args.hand_root_extra_rot_deg, dtype=np.float64).reshape(3).copy()
-            episode_root_rot_rad = np.deg2rad(episode_root_rot_deg)
-
             episode_out = args.output_dir / str(ep_id)
-            rgb_video_path = episode_out / "rgb.mp4"
-            hand_mask_video_path = episode_out / "hand_mask.mp4"
-            label_map_dir = episode_out / "label_map"
-            per_finger_base_dir = episode_out / "finger_masks"
             episode_out.mkdir(parents=True, exist_ok=True)
-            label_map_dir.mkdir(parents=True, exist_ok=True)
-            if args.save_per_finger_masks:
-                per_finger_base_dir.mkdir(parents=True, exist_ok=True)
-                for finger in FINGER_ORDER:
-                    (per_finger_base_dir / finger).mkdir(parents=True, exist_ok=True)
-
-            rgb_video_frames: List[np.ndarray] = []
-            hand_mask_video_frames: List[np.ndarray] = []
 
             sim.reset_pose()
+            camera_targets: List[DatasetCameraTarget] = []
+            for render_camera_name in render_camera_names:
+                view_index = CAMERA_TO_VIDEO_INDEX.get(render_camera_name, -1)
+                episode_seg_video_path: Optional[Path] = None
+                if view_index >= 0:
+                    episode_seg_video_path = resolve_segmentation_video_path(
+                        annotation_data=ann,
+                        dataset_base_dir=dataset_base_dir,
+                        view_index=view_index,
+                    )
+                    if episode_seg_video_path is None:
+                        fallback_seg = dataset_base_dir / "segmentation_videos" / str(ep_id) / f"{view_index}.mp4"
+                        if fallback_seg.exists():
+                            episode_seg_video_path = fallback_seg.resolve()
 
-            chosen_extrinsic: Optional[np.ndarray] = None
-            extrinsic_direction_mode = "not_applicable"
-            camera_projection_mode = "calibrated_intrinsics"
+                dataset_video_size = (
+                    probe_video_frame_size(episode_seg_video_path)
+                    if episode_seg_video_path is not None
+                    else None
+                )
+                output_video_width = (
+                    int(dataset_video_size[0]) if dataset_video_size is not None else int(args.width)
+                )
+                output_video_height = (
+                    int(dataset_video_size[1]) if dataset_video_size is not None else int(args.height)
+                )
+
+                camera_episode_out = episode_out / render_camera_name
+                label_map_dir = camera_episode_out / "label_map"
+                per_finger_base_dir = camera_episode_out / "finger_masks"
+                camera_episode_out.mkdir(parents=True, exist_ok=True)
+                label_map_dir.mkdir(parents=True, exist_ok=True)
+                if args.save_per_finger_masks:
+                    per_finger_base_dir.mkdir(parents=True, exist_ok=True)
+                    for finger in FINGER_ORDER:
+                        (per_finger_base_dir / finger).mkdir(parents=True, exist_ok=True)
+
+                camera_targets.append(
+                    DatasetCameraTarget(
+                        camera_name=render_camera_name,
+                        calib=calibration_map[render_camera_name],
+                        mode=resolve_camera_mode(render_camera_name, args.camera_mode),
+                        ee_offset=np.zeros(3, dtype=np.float64),
+                        view_index=view_index,
+                        output_video_width=output_video_width,
+                        output_video_height=output_video_height,
+                        episode_out=camera_episode_out,
+                        rgb_video_path=camera_episode_out / "rgb.mp4",
+                        hand_mask_video_path=camera_episode_out / "hand_mask.mp4",
+                        label_map_dir=label_map_dir,
+                        per_finger_base_dir=per_finger_base_dir,
+                        lines_path=camera_episode_out / "fingertips_and_pose.jsonl",
+                    )
+                )
 
             sim.apply_joint_vector(joint_values_for_frame(0), HAND_JOINT_ORDER)
-            apply_end_effector_pose_to_hand_root(
+            apply_end_effector_pose_to_ee_link(
                 sim,
+                args.ee_link,
                 ee_pose_seq[0],
-                episode_ee_offset,
-                episode_root_rot_rad,
+                camera_targets[0].ee_offset,
             )
             sim.forward()
 
-            extrinsic_raw = np.asarray(calib.extrinsic, dtype=np.float64)
-            if args.invert_extrinsic:
-                chosen_extrinsic = np.linalg.inv(extrinsic_raw)
-                extrinsic_direction_mode = "forced_inverse"
-            elif args.disable_auto_extrinsic_direction:
-                chosen_extrinsic = extrinsic_raw
-                extrinsic_direction_mode = "forced_raw"
-            else:
-                sample_points_world: List[np.ndarray] = []
-                resolved_ee_link = sim.resolve_body_name(args.ee_link)
-                if resolved_ee_link is not None:
-                    T_world_ee = sim.world_link_transform(resolved_ee_link)
-                    sample_points_world.append(T_world_ee[:3, 3].copy())
-                for spec in specs:
-                    T_world_link = sim.world_link_transform(spec.position_link)
-                    tip_world = T_world_link[:3, 3] + T_world_link[:3, :3] @ spec.local_offset_xyz
-                    sample_points_world.append(tip_world)
-                pts = np.asarray(sample_points_world, dtype=np.float64)
-                raw_in, raw_vis, _ = score_extrinsic_direction_for_pose(
-                    mode=mode,
-                    extrinsic=extrinsic_raw,
-                    sim=sim,
-                    ee_link=args.ee_link,
-                    ee_offset=episode_ee_offset,
-                    points_world=pts,
-                    K=calib.K,
-                    width=args.width,
-                    height=args.height,
-                )
-                inv_extrinsic = np.linalg.inv(extrinsic_raw)
-                inv_in, inv_vis, _ = score_extrinsic_direction_for_pose(
-                    mode=mode,
-                    extrinsic=inv_extrinsic,
-                    sim=sim,
-                    ee_link=args.ee_link,
-                    ee_offset=episode_ee_offset,
-                    points_world=pts,
-                    K=calib.K,
-                    width=args.width,
-                    height=args.height,
-                )
-                if raw_in > inv_in or (raw_in == inv_in and raw_vis >= inv_vis):
+            sample_points_world: List[np.ndarray] = []
+            resolved_ee_link = sim.resolve_body_name(args.ee_link)
+            if resolved_ee_link is not None:
+                T_world_ee = sim.world_link_transform(resolved_ee_link)
+                sample_points_world.append(T_world_ee[:3, 3].copy())
+            for spec in specs:
+                T_world_link = sim.world_link_transform(spec.position_link)
+                tip_world = T_world_link[:3, 3] + T_world_link[:3, :3] @ spec.local_offset_xyz
+                sample_points_world.append(tip_world)
+            pts = np.asarray(sample_points_world, dtype=np.float64)
+
+            camera_runtime: Dict[str, Dict[str, object]] = {}
+            for target in camera_targets:
+                chosen_extrinsic: np.ndarray
+                extrinsic_direction_mode = "not_applicable"
+                extrinsic_raw = np.asarray(target.calib.extrinsic, dtype=np.float64)
+                if args.invert_extrinsic:
+                    chosen_extrinsic = np.linalg.inv(extrinsic_raw)
+                    extrinsic_direction_mode = "forced_inverse"
+                elif args.disable_auto_extrinsic_direction:
                     chosen_extrinsic = extrinsic_raw
-                    extrinsic_direction_mode = f"auto_raw(in_frame={raw_in},visible={raw_vis})"
+                    extrinsic_direction_mode = "forced_raw"
                 else:
-                    chosen_extrinsic = inv_extrinsic
-                    extrinsic_direction_mode = f"auto_inverse(in_frame={inv_in},visible={inv_vis})"
+                    raw_in, raw_vis, _ = score_extrinsic_direction_for_pose(
+                        mode=target.mode,
+                        extrinsic=extrinsic_raw,
+                        sim=sim,
+                        ee_link=resolve_camera_reference_link(target.camera_name, args.ee_link),
+                        ee_offset=target.ee_offset,
+                        points_world=pts,
+                        K=target.calib.K,
+                        width=args.width,
+                        height=args.height,
+                    )
+                    inv_extrinsic = np.linalg.inv(extrinsic_raw)
+                    inv_in, inv_vis, _ = score_extrinsic_direction_for_pose(
+                        mode=target.mode,
+                        extrinsic=inv_extrinsic,
+                        sim=sim,
+                        ee_link=resolve_camera_reference_link(target.camera_name, args.ee_link),
+                        ee_offset=target.ee_offset,
+                        points_world=pts,
+                        K=target.calib.K,
+                        width=args.width,
+                        height=args.height,
+                    )
+                    if raw_in > inv_in or (raw_in == inv_in and raw_vis >= inv_vis):
+                        chosen_extrinsic = extrinsic_raw
+                        extrinsic_direction_mode = f"auto_raw(in_frame={raw_in},visible={raw_vis})"
+                    else:
+                        chosen_extrinsic = inv_extrinsic
+                        extrinsic_direction_mode = f"auto_inverse(in_frame={inv_in},visible={inv_vis})"
 
-            seg_degenerate_frames = 0
-            lines_path = episode_out / "fingertips_and_pose.jsonl"
+                camera_runtime[target.camera_name] = {
+                    "target": target,
+                    "chosen_extrinsic": chosen_extrinsic,
+                    "extrinsic_direction_mode": extrinsic_direction_mode,
+                    "camera_projection_mode": "calibrated_intrinsics",
+                    "seg_degenerate_frames": 0,
+                    "rgb_video_frames": [],
+                    "hand_mask_video_frames": [],
+                }
 
-            with lines_path.open("w", encoding="utf-8") as lines_f:
+            line_handles: Dict[str, object] = {}
+            try:
+                for target in camera_targets:
+                    line_handles[target.camera_name] = target.lines_path.open("w", encoding="utf-8")
+
                 for frame_idx in range(frame_count):
                     applied_joints = sim.apply_joint_vector(joint_values_for_frame(frame_idx), HAND_JOINT_ORDER)
-                    ee_pose_apply_info = apply_end_effector_pose_to_hand_root(
+                    ee_pose_apply_info = apply_end_effector_pose_to_ee_link(
                         sim,
+                        args.ee_link,
                         ee_pose_seq[frame_idx],
-                        episode_ee_offset,
-                        episode_root_rot_rad,
+                        camera_targets[0].ee_offset,
                     )
                     sim.forward()
 
-                    assert chosen_extrinsic is not None
-                    T_world_camera = compute_world_camera_transform(
-                        mode=mode,
-                        extrinsic=chosen_extrinsic,
-                        sim=sim,
-                        ee_link=args.ee_link,
-                        ee_offset=episode_ee_offset,
-                    )
-                    camera_state = CameraState(
-                        kind="calibrated",
-                        T_world_camera=T_world_camera,
-                        K=calib.K,
-                    )
-
-                    rgb, geom_ids = sim.render_rgb_and_seg(
-                        camera_state=camera_state,
-                    )
-                    hand_mask, link_idx_map, seg_degenerate = decode_hand_segmentation_from_geom_ids(
-                        geom_ids,
-                        sim.model,
-                        hand_body_ids,
-                    )
-                    if seg_degenerate:
-                        seg_degenerate_frames += 1
-
-                    label_map = np.zeros((args.height, args.width), dtype=np.uint8)
-                    fingertips_payload: Dict[str, Dict[str, object]] = {}
-                    per_finger_masks: Dict[str, np.ndarray] = {}
-
-                    for spec in specs:
-                        T_world_link = sim.world_link_transform(spec.position_link)
-                        tip_world = T_world_link[:3, 3] + T_world_link[:3, :3] @ spec.local_offset_xyz
-
-                        cam_xyz, pix_xy = _project_tip_for_camera(
-                            tip_world=tip_world,
+                    for target in camera_targets:
+                        runtime = camera_runtime[target.camera_name]
+                        chosen_extrinsic = np.asarray(runtime["chosen_extrinsic"], dtype=np.float64)
+                        T_world_camera = compute_world_camera_transform(
+                            mode=target.mode,
+                            extrinsic=chosen_extrinsic,
+                            sim=sim,
+                            ee_link=resolve_camera_reference_link(target.camera_name, args.ee_link),
+                            ee_offset=target.ee_offset,
+                        )
+                        camera_state = CameraState(
+                            kind="calibrated",
+                            calibration_camera_name=target.camera_name,
                             T_world_camera=T_world_camera,
-                            K=calib.K,
+                            K=target.calib.K,
                         )
+                        if viewer is not None and target.camera_name == camera_targets[0].camera_name:
+                            sim.sync_viewer(viewer, camera_state)
 
-                        visible = bool(
-                            cam_xyz[2] > 1e-9
-                            and 0.0 <= pix_xy[0] < args.width
-                            and 0.0 <= pix_xy[1] < args.height
+                        rgb, geom_ids = sim.render_rgb_and_seg(camera_state=camera_state)
+                        hand_mask, link_idx_map, seg_degenerate = decode_hand_segmentation_from_geom_ids(
+                            geom_ids,
+                            sim.model,
+                            hand_body_ids,
                         )
+                        if seg_degenerate:
+                            runtime["seg_degenerate_frames"] = int(runtime["seg_degenerate_frames"]) + 1
 
-                        chosen_mask = np.zeros_like(hand_mask, dtype=bool)
-                        chosen_link_name: Optional[str] = None
-                        for candidate_name in spec.mask_link_candidates:
-                            candidate_body = sim.body_name_to_id.get(candidate_name)
-                            if candidate_body is None:
-                                continue
-                            candidate_mask = hand_mask & (link_idx_map == int(candidate_body))
-                            if np.any(candidate_mask):
-                                chosen_mask = candidate_mask
-                                chosen_link_name = candidate_name
-                                break
+                        label_map = np.zeros((args.height, args.width), dtype=np.uint8)
+                        fingertips_payload: Dict[str, Dict[str, object]] = {}
+                        per_finger_masks: Dict[str, np.ndarray] = {}
 
-                        per_finger_masks[spec.finger] = chosen_mask
-                        label_id = FINGER_LABEL_ID[spec.finger]
-                        label_map[chosen_mask] = label_id
+                        for spec in specs:
+                            T_world_link = sim.world_link_transform(spec.position_link)
+                            tip_world = T_world_link[:3, 3] + T_world_link[:3, :3] @ spec.local_offset_xyz
 
-                        fingertips_payload[spec.finger] = {
-                            "world_xyz": tip_world.tolist(),
-                            "camera_xyz": cam_xyz.tolist(),
-                            "pixel_xy": pix_xy.tolist(),
-                            "visible_in_frame": visible,
-                            "position_link": spec.position_link,
-                            "local_offset_xyz": spec.local_offset_xyz.tolist(),
-                            "mask_link": chosen_link_name,
-                            "mask_pixel_count": int(np.count_nonzero(chosen_mask)),
+                            cam_xyz, pix_xy = _project_tip_for_camera(
+                                tip_world=tip_world,
+                                T_world_camera=T_world_camera,
+                                K=target.calib.K,
+                            )
+
+                            visible = bool(
+                                cam_xyz[2] > 1e-9
+                                and 0.0 <= pix_xy[0] < args.width
+                                and 0.0 <= pix_xy[1] < args.height
+                            )
+
+                            chosen_mask = np.zeros_like(hand_mask, dtype=bool)
+                            chosen_link_name: Optional[str] = None
+                            for candidate_name in spec.mask_link_candidates:
+                                candidate_body = sim.body_name_to_id.get(candidate_name)
+                                if candidate_body is None:
+                                    continue
+                                candidate_mask = hand_mask & (link_idx_map == int(candidate_body))
+                                if np.any(candidate_mask):
+                                    chosen_mask = candidate_mask
+                                    chosen_link_name = candidate_name
+                                    break
+
+                            per_finger_masks[spec.finger] = chosen_mask
+                            label_id = FINGER_LABEL_ID[spec.finger]
+                            label_map[chosen_mask] = label_id
+
+                            fingertips_payload[spec.finger] = {
+                                "world_xyz": tip_world.tolist(),
+                                "camera_xyz": cam_xyz.tolist(),
+                                "pixel_xy": pix_xy.tolist(),
+                                "visible_in_frame": visible,
+                                "position_link": spec.position_link,
+                                "local_offset_xyz": spec.local_offset_xyz.tolist(),
+                                "mask_link": chosen_link_name,
+                                "mask_pixel_count": int(np.count_nonzero(chosen_mask)),
+                            }
+
+                        rgb_out = _resize_rgb_bilinear(
+                            rgb,
+                            width=target.output_video_width,
+                            height=target.output_video_height,
+                        )
+                        runtime["rgb_video_frames"].append(rgb_out)
+
+                        hand_mask_vis = np.where(hand_mask, 255, 0).astype(np.uint8)
+                        if hand_mask_vis.shape != (target.output_video_height, target.output_video_width):
+                            hand_mask_vis = np.where(
+                                _resize_mask_nearest(
+                                    hand_mask,
+                                    width=target.output_video_width,
+                                    height=target.output_video_height,
+                                ),
+                                255,
+                                0,
+                            ).astype(np.uint8)
+                        hand_mask_rgb = np.repeat(hand_mask_vis[:, :, None], 3, axis=2)
+                        runtime["hand_mask_video_frames"].append(hand_mask_rgb)
+
+                        Image.fromarray(label_map, mode="L").save(
+                            target.label_map_dir / f"{frame_idx:06d}.png"
+                        )
+                        if args.save_per_finger_masks:
+                            for finger in FINGER_ORDER:
+                                save_mask(
+                                    target.per_finger_base_dir / finger / f"{frame_idx:06d}.png",
+                                    per_finger_masks[finger],
+                                )
+
+                        line_obj = {
+                            "frame_index": frame_idx,
+                            "camera_name": target.camera_name,
+                            "camera_mode": target.mode,
+                            "hand_joint_source": joint_key,
+                            "applied_hand_joints": applied_joints,
+                            "end_effector_pose": ee_pose_apply_info,
+                            "fingertips": fingertips_payload,
+                            "hand_mask_pixel_count": int(np.count_nonzero(hand_mask)),
                         }
+                        line_handles[target.camera_name].write(json.dumps(line_obj) + "\n")
+            finally:
+                for handle in line_handles.values():
+                    handle.close()
 
-                    rgb_out = _resize_rgb_bilinear(rgb, width=output_video_width, height=output_video_height)
-                    rgb_video_frames.append(rgb_out)
+            for target in camera_targets:
+                runtime = camera_runtime[target.camera_name]
+                rgb_video_frames = runtime["rgb_video_frames"]
+                hand_mask_video_frames = runtime["hand_mask_video_frames"]
+                if rgb_video_frames:
+                    media.write_video(str(target.rgb_video_path), rgb_video_frames, fps=float(args.video_fps))
+                if hand_mask_video_frames:
+                    media.write_video(
+                        str(target.hand_mask_video_path),
+                        hand_mask_video_frames,
+                        fps=float(args.video_fps),
+                    )
 
-                    hand_mask_vis = np.where(hand_mask, 255, 0).astype(np.uint8)
-                    if hand_mask_vis.shape != (output_video_height, output_video_width):
-                        hand_mask_vis = np.where(
-                            _resize_mask_nearest(hand_mask, width=output_video_width, height=output_video_height),
-                            255,
-                            0,
-                        ).astype(np.uint8)
-                    hand_mask_rgb = np.repeat(hand_mask_vis[:, :, None], 3, axis=2)
-                    hand_mask_video_frames.append(hand_mask_rgb)
-
-                    Image.fromarray(label_map, mode="L").save(label_map_dir / f"{frame_idx:06d}.png")
-                    if args.save_per_finger_masks:
-                        for finger in FINGER_ORDER:
-                            save_mask(per_finger_base_dir / finger / f"{frame_idx:06d}.png", per_finger_masks[finger])
-
-                    line_obj = {
-                        "frame_index": frame_idx,
-                        "hand_joint_source": joint_key,
-                        "applied_hand_joints": applied_joints,
-                        "end_effector_pose": ee_pose_apply_info,
-                        "fingertips": fingertips_payload,
-                        "hand_mask_pixel_count": int(np.count_nonzero(hand_mask)),
-                    }
-                    lines_f.write(json.dumps(line_obj) + "\n")
-
-            if rgb_video_frames:
-                media.write_video(str(rgb_video_path), rgb_video_frames, fps=float(args.video_fps))
-            if hand_mask_video_frames:
-                media.write_video(str(hand_mask_video_path), hand_mask_video_frames, fps=float(args.video_fps))
-
-            meta = {
-                "episode_id": ep_id,
-                "annotation_path": str(ann_path),
-                "frame_count_rendered": frame_count,
-                "camera_setup": args.camera_setup,
-                "camera_name": camera_name,
-                "camera_mode": mode,
-                "extrinsic_direction": extrinsic_direction_mode,
-                "camera_projection_mode": camera_projection_mode,
-                "used_renderer": "mujoco_renderer",
-                "segmentation_degenerate_frames": int(seg_degenerate_frames),
-                "model_path": str(args.model_path),
-                "calibration_dir": str(args.calibration_dir),
-                "output_dir": str(episode_out),
-                "rgb_video_path": str(rgb_video_path),
-                "hand_mask_video_path": str(hand_mask_video_path),
-                "video_fps": float(args.video_fps),
-                "output_video_size": [int(output_video_width), int(output_video_height)],
-                "hand_joint_source_key": joint_key,
-                "end_effector_pose_key": args.palm_pose_key,
-                "end_effector_offset_applied_at_root_xyz": episode_ee_offset.tolist(),
-                "hand_root_extra_rot_xyz_deg": episode_root_rot_deg.tolist(),
-                "hand_root_extra_rot_xyz_rad": episode_root_rot_rad.tolist(),
-                "hand_joint_order": HAND_JOINT_ORDER,
-                "image_size": [args.width, args.height],
-                "hand_root_frame_overlay": {
-                    "enabled": bool(not args.no_hand_root_frame_overlay),
-                    "axis_length_m": float(args.hand_root_frame_axis_length),
-                    "source": "mujoco_scene",
-                },
-                "first_frame_joint_override": "zero",
-                "simulator": "mujoco",
-            }
-            with (episode_out / "render_meta.json").open("w", encoding="utf-8") as f:
-                json.dump(meta, f, indent=2)
-
-            print(
-                f"[done][episode {ep_id}] frames={frame_count} renderer=mujoco_renderer "
-                f"degenerate_seg={seg_degenerate_frames} out={episode_out}"
-            )
+                print(
+                    f"[done][episode {ep_id}][{target.camera_name}] frames={frame_count} "
+                    f"renderer=mujoco_renderer degenerate_seg={int(runtime['seg_degenerate_frames'])} "
+                    f"out={target.episode_out}"
+                )
     finally:
+        if viewer is not None:
+            try:
+                viewer.close()
+            except Exception:
+                pass
         sim.close()
 
 
@@ -1338,221 +1463,12 @@ def main() -> None:
             "mujoco is required for this script. "
             f"Import error: {MUJOCO_IMPORT_ERROR}"
         )
-
-    if args.dataset_root is not None or args.annotation_dir is not None:
-        run_dataset_mode(args)
-        return
-
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-
-    if not args.model_path.exists():
-        raise FileNotFoundError(f"Model file not found: {args.model_path}")
-
-    camera_name = pick_camera_name(args)
-    resolved_ee_offset_default = resolve_ee_translation_offset(
-        camera_name=camera_name, override_xyz=args.ee_translation_offset
-    )
-
-    calibration_map = load_calibration_map(args.calibration_dir)
-    if camera_name not in calibration_map:
-        raise KeyError(
-            f'Camera "{camera_name}" not found in calibration. '
-            f"Available: {sorted(calibration_map.keys())}"
+    if args.show_viewer and mujoco_viewer is None:
+        raise ImportError(
+            "mujoco.viewer is required for --show-viewer. "
+            f"Import error: {MUJOCO_VIEWER_IMPORT_ERROR}"
         )
-    calib = calibration_map[camera_name]
-
-    sim = MujocoHandSim(args.model_path, width=args.width, height=args.height)
-    try:
-        sim.set_frame_visualization(
-            enabled=bool(not args.no_hand_root_frame_overlay),
-            axis_length_m=float(args.hand_root_frame_axis_length),
-        )
-        specs = build_fingertip_specs(sim.body_name_to_id)
-        excluded_body_ids = {
-            int(sim.body_name_to_id[name])
-            for name in EXCLUDED_HAND_MASK_LINK_NAMES
-            if name in sim.body_name_to_id
-        }
-        hand_body_ids = set(sim.body_name_to_id.values()) - excluded_body_ids
-
-        overrides = load_joint_overrides(args)
-        sim.reset_pose()
-        for joint_name, target in overrides.items():
-            if joint_name not in sim.joint_name_to_id:
-                raise KeyError(f'Unknown joint "{joint_name}" in overrides.')
-            sim.set_joint_value(joint_name, target)
-        sim.forward()
-
-        mode = resolve_camera_mode(camera_name, args.camera_mode)
-        T_world_camera: Optional[np.ndarray] = None
-        extrinsic_direction_mode = "not_applicable"
-        camera_projection_mode = "calibrated_intrinsics"
-
-        extrinsic_raw = np.asarray(calib.extrinsic, dtype=np.float64)
-        ee_offset = np.asarray(resolved_ee_offset_default, dtype=np.float64).reshape(3)
-
-        if args.invert_extrinsic:
-            extrinsic = np.linalg.inv(extrinsic_raw)
-            T_world_camera = compute_world_camera_transform(
-                mode=mode,
-                extrinsic=extrinsic,
-                sim=sim,
-                ee_link=args.ee_link,
-                ee_offset=ee_offset,
-            )
-            extrinsic_direction_mode = "forced_inverse"
-        elif not args.disable_auto_extrinsic_direction:
-            sample_points_world: List[np.ndarray] = []
-            resolved_ee_link = sim.resolve_body_name(args.ee_link)
-            if resolved_ee_link is not None:
-                T_world_ee = sim.world_link_transform(resolved_ee_link)
-                sample_points_world.append(T_world_ee[:3, 3].copy())
-            for spec in specs:
-                T_world_link = sim.world_link_transform(spec.position_link)
-                tip_world = T_world_link[:3, 3] + T_world_link[:3, :3] @ spec.local_offset_xyz
-                sample_points_world.append(tip_world)
-            points_world_arr = np.asarray(sample_points_world, dtype=np.float64)
-
-            raw_in, raw_vis, T_world_camera_raw = score_extrinsic_direction_for_pose(
-                mode=mode,
-                extrinsic=extrinsic_raw,
-                sim=sim,
-                ee_link=args.ee_link,
-                ee_offset=ee_offset,
-                points_world=points_world_arr,
-                K=calib.K,
-                width=args.width,
-                height=args.height,
-            )
-            inv_extrinsic = np.linalg.inv(extrinsic_raw)
-            inv_in, inv_vis, T_world_camera_inv = score_extrinsic_direction_for_pose(
-                mode=mode,
-                extrinsic=inv_extrinsic,
-                sim=sim,
-                ee_link=args.ee_link,
-                ee_offset=ee_offset,
-                points_world=points_world_arr,
-                K=calib.K,
-                width=args.width,
-                height=args.height,
-            )
-            if raw_in > inv_in or (raw_in == inv_in and raw_vis >= inv_vis):
-                T_world_camera = T_world_camera_raw
-                extrinsic_direction_mode = f"auto_raw(in_frame={raw_in},visible={raw_vis})"
-            else:
-                T_world_camera = T_world_camera_inv
-                extrinsic_direction_mode = f"auto_inverse(in_frame={inv_in},visible={inv_vis})"
-        else:
-            T_world_camera = compute_world_camera_transform(
-                mode=mode,
-                extrinsic=extrinsic_raw,
-                sim=sim,
-                ee_link=args.ee_link,
-                ee_offset=ee_offset,
-            )
-            extrinsic_direction_mode = "forced_raw"
-
-        camera_state = CameraState(
-            kind="calibrated",
-            T_world_camera=T_world_camera,
-            K=calib.K,
-        )
-        rgb, geom_ids = sim.render_rgb_and_seg(
-            camera_state=camera_state,
-        )
-
-        hand_mask, link_idx_map, seg_degenerate = decode_hand_segmentation_from_geom_ids(
-            geom_ids,
-            sim.model,
-            hand_body_ids,
-        )
-        if seg_degenerate:
-            print("[warning] Segmentation buffer appears degenerate (all background).")
-
-        label_map = np.zeros((args.height, args.width), dtype=np.uint8)
-        fingertip_payload: Dict[str, Dict[str, object]] = {}
-
-        for spec in specs:
-            T_world_link = sim.world_link_transform(spec.position_link)
-            tip_world = T_world_link[:3, 3] + T_world_link[:3, :3] @ spec.local_offset_xyz
-
-            cam_xyz, pix_xy = _project_tip_for_camera(
-                tip_world=tip_world,
-                T_world_camera=T_world_camera,
-                K=calib.K,
-            )
-            visible = bool(
-                cam_xyz[2] > 1e-9
-                and 0.0 <= pix_xy[0] < args.width
-                and 0.0 <= pix_xy[1] < args.height
-            )
-
-            chosen_mask = np.zeros_like(hand_mask, dtype=bool)
-            chosen_link_name: Optional[str] = None
-            for candidate_name in spec.mask_link_candidates:
-                candidate_body = sim.body_name_to_id.get(candidate_name)
-                if candidate_body is None:
-                    continue
-                candidate_mask = hand_mask & (link_idx_map == int(candidate_body))
-                if np.any(candidate_mask):
-                    chosen_mask = candidate_mask
-                    chosen_link_name = candidate_name
-                    break
-
-            label_id = FINGER_LABEL_ID[spec.finger]
-            label_map[chosen_mask] = label_id
-            save_mask(args.output_dir / f"{spec.finger}_mask.png", chosen_mask)
-
-            fingertip_payload[spec.finger] = {
-                "world_xyz": tip_world.tolist(),
-                "camera_xyz": cam_xyz.tolist(),
-                "pixel_xy": pix_xy.tolist(),
-                "visible_in_frame": visible,
-                "position_link": spec.position_link,
-                "local_offset_xyz": spec.local_offset_xyz.tolist(),
-                "mask_link": chosen_link_name,
-                "mask_pixel_count": int(np.count_nonzero(chosen_mask)),
-            }
-
-        save_mask(args.output_dir / "hand_mask.png", hand_mask)
-        np.save(args.output_dir / "label_map.npy", label_map)
-        Image.fromarray(label_map, mode="L").save(args.output_dir / "label_map.png")
-        if args.save_rgb:
-            Image.fromarray(rgb, mode="RGB").save(args.output_dir / "rgb.png")
-
-        output_json = {
-            "camera_setup": args.camera_setup,
-            "camera_name": camera_name,
-            "camera_mode": mode,
-            "extrinsic_direction": extrinsic_direction_mode,
-            "camera_projection_mode": camera_projection_mode,
-            "used_renderer": "mujoco_renderer",
-            "model_path": str(args.model_path),
-            "calibration_dir": str(args.calibration_dir),
-            "image_size": [args.width, args.height],
-            "near_far": [args.near, args.far],
-            "hand_root_frame_overlay": {
-                "enabled": bool(not args.no_hand_root_frame_overlay),
-                "axis_length_m": float(args.hand_root_frame_axis_length),
-                "source": "mujoco_scene",
-            },
-            "joint_overrides": overrides,
-            "hand_mask_pixel_count": int(np.count_nonzero(hand_mask)),
-            "fingertips": fingertip_payload,
-            "simulator": "mujoco",
-        }
-        with (args.output_dir / "fingertip_positions.json").open("w", encoding="utf-8") as f:
-            json.dump(output_json, f, indent=2)
-
-        print(f"[done] output_dir: {args.output_dir}")
-        print(f"[done] camera: {camera_name} (mode={mode})")
-        print(f"[done] extrinsic direction: {extrinsic_direction_mode}")
-        print("[done] renderer: mujoco_renderer")
-        print(f"[done] saved fingertip positions: {args.output_dir / 'fingertip_positions.json'}")
-        print(f"[done] saved hand mask: {args.output_dir / 'hand_mask.png'}")
-        print(f"[done] saved label map: {args.output_dir / 'label_map.npy'}")
-    finally:
-        sim.close()
+    run_dataset_mode(args)
 
 
 if __name__ == "__main__":
