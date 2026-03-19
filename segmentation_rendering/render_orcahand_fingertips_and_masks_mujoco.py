@@ -620,6 +620,40 @@ def resolve_segmentation_video_path(
     return (dataset_base_dir / rel_path).resolve()
 
 
+def _to_dataset_relative_path(path: Path, dataset_base_dir: Path) -> str:
+    try:
+        return path.resolve().relative_to(dataset_base_dir.resolve()).as_posix()
+    except ValueError:
+        return os.path.relpath(path.resolve(), start=dataset_base_dir.resolve()).replace("\\", "/")
+
+
+def update_vis_seg_actions_annotation(
+    annotation_data: Dict[str, object],
+    dataset_base_dir: Path,
+    camera_targets: Sequence[DatasetCameraTarget],
+) -> None:
+    indexed_paths: Dict[int, str] = {}
+    for target in camera_targets:
+        if target.view_index < 0 or target.vis_seg_actions_video_path is None:
+            continue
+        indexed_paths[target.view_index] = _to_dataset_relative_path(
+            target.vis_seg_actions_video_path,
+            dataset_base_dir=dataset_base_dir,
+        )
+    if not indexed_paths:
+        return
+
+    max_view_index = max(indexed_paths.keys())
+    vis_entries: List[Dict[str, str]] = []
+    for view_index in range(max_view_index + 1):
+        rel_path = indexed_paths.get(view_index)
+        if rel_path is None:
+            vis_entries.append({})
+            continue
+        vis_entries.append({"video_path": rel_path})
+    annotation_data["vis_seg_actions"] = vis_entries
+
+
 def _resize_mask_nearest(mask: np.ndarray, width: int, height: int) -> np.ndarray:
     if mask.shape == (height, width):
         return np.asarray(mask, dtype=bool)
@@ -2106,6 +2140,15 @@ def run_dataset_mode(args: argparse.Namespace) -> None:
                     f"out={target.episode_out} "
                     f"vis_seg_actions={target.vis_seg_actions_video_path}"
                 )
+
+            update_vis_seg_actions_annotation(
+                annotation_data=ann,
+                dataset_base_dir=dataset_base_dir,
+                camera_targets=camera_targets,
+            )
+            with ann_path.open("w", encoding="utf-8") as f:
+                json.dump(ann, f, ensure_ascii=False, indent=2)
+                f.write("\n")
     finally:
         if viewer is not None:
             try:
