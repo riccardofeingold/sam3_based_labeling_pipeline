@@ -16,7 +16,6 @@ import json
 import math
 import os
 import pickle
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -163,6 +162,7 @@ class DatasetCameraTarget:
     episode_out: Path
     rgb_video_path: Path
     hand_mask_video_path: Path
+    vis_seg_actions_video_path: Optional[Path]
     label_map_dir: Path
     per_finger_base_dir: Path
     lines_path: Path
@@ -195,6 +195,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "LeRobot dataset root containing annotation/ or annotations/. "
             "If set, runs dataset batch rendering mode."
+        ),
+    )
+    parser.add_argument(
+        "--vis-seg-actions-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory to write simulated segmentation mask videos in dataset layout "
+            "(default: <dataset_root>/vis_seg_actions)."
         ),
     )
     parser.add_argument(
@@ -285,6 +294,17 @@ def parse_args() -> argparse.Namespace:
         "--save-per-finger-masks",
         action="store_true",
         help="In dataset mode, save per-finger binary mask PNG per frame.",
+    )
+    parser.add_argument(
+        "--hand-mask-color",
+        type=int,
+        nargs=3,
+        metavar=("R", "G", "B"),
+        default=(0, 255, 0),
+        help=(
+            "RGB color for the rendered hand mask videos. "
+            "Example: --hand-mask-color 0 255 0"
+        ),
     )
     parser.add_argument(
         "--video-fps",
@@ -620,19 +640,45 @@ def _resize_rgb_bilinear(frame_rgb: np.ndarray, width: int, height: int) -> np.n
 def probe_video_frame_size(video_path: Path) -> Optional[Tuple[int, int]]:
     if not video_path.exists():
         return None
+    
     try:
-        import cv2  # type: ignore
+        video = media.read_video(str(video_path))
+        return (video.shape[2], video.shape[1])
     except Exception:
-        cv2 = None
-    if cv2 is not None:
-        cap = cv2.VideoCapture(str(video_path))
-        if cap.isOpened():
-            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            cap.release()
-            if w > 0 and h > 0:
-                return (w, h)
-    return None
+        return None
+
+
+def resolve_output_video_size(
+    args: argparse.Namespace,
+    ep_id: int,
+    camera_name: str,
+    seg_video_path: Optional[Path],
+) -> Tuple[int, int]:
+    dataset_video_size = (
+        probe_video_frame_size(seg_video_path) if seg_video_path is not None else None
+    )
+    if dataset_video_size is not None:
+        width = int(dataset_video_size[0])
+        height = int(dataset_video_size[1])
+        print(
+            f"[episode {ep_id}][{camera_name}] segmentation video frame size: "
+            f"{width}x{height} ({seg_video_path})"
+        )
+        return width, height
+
+    width = int(args.width)
+    height = int(args.height)
+    if seg_video_path is not None:
+        print(
+            f"[episode {ep_id}][{camera_name}] could not read segmentation video frame size "
+            f"from {seg_video_path}; falling back to args size {width}x{height}"
+        )
+    else:
+        print(
+            f"[episode {ep_id}][{camera_name}] no segmentation video found; "
+            f"using args size {width}x{height}"
+        )
+    return width, height
 
 
 def load_video_frames_mediapy(video_path: Path) -> np.ndarray:
@@ -1281,16 +1327,11 @@ def build_episode_camera_targets(
                 if fallback_seg.exists():
                     episode_seg_video_path = fallback_seg.resolve()
 
-        dataset_video_size = (
-            probe_video_frame_size(episode_seg_video_path)
-            if episode_seg_video_path is not None
-            else None
-        )
-        output_video_width = (
-            int(dataset_video_size[0]) if dataset_video_size is not None else int(args.width)
-        )
-        output_video_height = (
-            int(dataset_video_size[1]) if dataset_video_size is not None else int(args.height)
+        output_video_width, output_video_height = resolve_output_video_size(
+            args=args,
+            ep_id=ep_id,
+            camera_name=render_camera_name,
+            seg_video_path=episode_seg_video_path,
         )
 
         camera_episode_out = episode_out / render_camera_name
@@ -1316,6 +1357,7 @@ def build_episode_camera_targets(
                 episode_out=camera_episode_out,
                 rgb_video_path=camera_episode_out / "rgb.mp4",
                 hand_mask_video_path=camera_episode_out / "hand_mask.mp4",
+                vis_seg_actions_video_path=None,
                 label_map_dir=label_map_dir,
                 per_finger_base_dir=per_finger_base_dir,
                 lines_path=camera_episode_out / "fingertips_and_pose.jsonl",
@@ -1598,6 +1640,8 @@ def optimize_body_local_position(
 def run_dataset_mode(args: argparse.Namespace) -> None:
     if args.dataset_root is None and args.annotation_dir is None:
         raise ValueError("Dataset mode requires --dataset-root or --annotation-dir.")
+    if len(args.hand_mask_color) != 3 or any((c < 0 or c > 255) for c in args.hand_mask_color):
+        raise ValueError("--hand-mask-color expects exactly 3 integers in [0, 255].")
     if media is None:
         raise ImportError(
             "mediapy is required for dataset-mode video export. "
@@ -1609,6 +1653,12 @@ def run_dataset_mode(args: argparse.Namespace) -> None:
     if not annotation_dir.exists():
         raise FileNotFoundError(f"Annotation directory not found: {annotation_dir}")
     dataset_base_dir = resolve_dataset_base_dir(args, annotation_dir)
+    vis_seg_actions_root = (
+        args.vis_seg_actions_dir
+        if args.vis_seg_actions_dir is not None
+        else (dataset_base_dir / "vis_seg_actions")
+    )
+    vis_seg_actions_root.mkdir(parents=True, exist_ok=True)
 
     files_by_id: Dict[int, Path] = {}
     for pth in annotation_dir.glob("*.json"):
@@ -1761,21 +1811,24 @@ def run_dataset_mode(args: argparse.Namespace) -> None:
                         if fallback_seg.exists():
                             episode_seg_video_path = fallback_seg.resolve()
 
-                dataset_video_size = (
-                    probe_video_frame_size(episode_seg_video_path)
-                    if episode_seg_video_path is not None
-                    else None
-                )
-                output_video_width = (
-                    int(dataset_video_size[0]) if dataset_video_size is not None else int(args.width)
-                )
-                output_video_height = (
-                    int(dataset_video_size[1]) if dataset_video_size is not None else int(args.height)
+                output_video_width, output_video_height = resolve_output_video_size(
+                    args=args,
+                    ep_id=ep_id,
+                    camera_name=render_camera_name,
+                    seg_video_path=episode_seg_video_path,
                 )
 
                 camera_episode_out = episode_out / render_camera_name
                 label_map_dir = camera_episode_out / "label_map"
                 per_finger_base_dir = camera_episode_out / "finger_masks"
+                vis_episode_out = vis_seg_actions_root / str(ep_id)
+                vis_episode_out.mkdir(parents=True, exist_ok=True)
+                vis_file_stem = (
+                    str(view_index)
+                    if view_index >= 0
+                    else render_camera_name
+                )
+                vis_seg_actions_video_path = vis_episode_out / f"{vis_file_stem}.mp4"
                 camera_episode_out.mkdir(parents=True, exist_ok=True)
                 label_map_dir.mkdir(parents=True, exist_ok=True)
                 if args.save_per_finger_masks:
@@ -1796,6 +1849,7 @@ def run_dataset_mode(args: argparse.Namespace) -> None:
                         episode_out=camera_episode_out,
                         rgb_video_path=camera_episode_out / "rgb.mp4",
                         hand_mask_video_path=camera_episode_out / "hand_mask.mp4",
+                        vis_seg_actions_video_path=vis_seg_actions_video_path,
                         label_map_dir=label_map_dir,
                         per_finger_base_dir=per_finger_base_dir,
                         lines_path=camera_episode_out / "fingertips_and_pose.jsonl",
@@ -1971,18 +2025,19 @@ def run_dataset_mode(args: argparse.Namespace) -> None:
                         )
                         runtime["rgb_video_frames"].append(rgb_out)
 
-                        hand_mask_vis = np.where(hand_mask, 255, 0).astype(np.uint8)
-                        if hand_mask_vis.shape != (target.output_video_height, target.output_video_width):
-                            hand_mask_vis = np.where(
-                                _resize_mask_nearest(
-                                    hand_mask,
-                                    width=target.output_video_width,
-                                    height=target.output_video_height,
-                                ),
-                                255,
-                                0,
-                            ).astype(np.uint8)
-                        hand_mask_rgb = np.repeat(hand_mask_vis[:, :, None], 3, axis=2)
+                        hand_mask_for_video = hand_mask
+                        if hand_mask_for_video.shape != (target.output_video_height, target.output_video_width):
+                            hand_mask_for_video = _resize_mask_nearest(
+                                hand_mask_for_video,
+                                width=target.output_video_width,
+                                height=target.output_video_height,
+                            )
+                        hand_mask_rgb = np.zeros(
+                            (target.output_video_height, target.output_video_width, 3),
+                            dtype=np.uint8,
+                        )
+                        mask_color_rgb = np.asarray(args.hand_mask_color, dtype=np.uint8).reshape(1, 3)
+                        hand_mask_rgb[hand_mask_for_video] = mask_color_rgb
                         runtime["hand_mask_video_frames"].append(hand_mask_rgb)
 
                         label_map_out = label_map
@@ -2038,11 +2093,18 @@ def run_dataset_mode(args: argparse.Namespace) -> None:
                         hand_mask_video_frames,
                         fps=float(args.video_fps),
                     )
+                    if target.vis_seg_actions_video_path is not None:
+                        media.write_video(
+                            str(target.vis_seg_actions_video_path),
+                            hand_mask_video_frames,
+                            fps=float(args.video_fps),
+                        )
 
                 print(
                     f"[done][episode {ep_id}][{target.camera_name}] frames={frame_count} "
                     f"renderer=mujoco_renderer degenerate_seg={int(runtime['seg_degenerate_frames'])} "
-                    f"out={target.episode_out}"
+                    f"out={target.episode_out} "
+                    f"vis_seg_actions={target.vis_seg_actions_video_path}"
                 )
     finally:
         if viewer is not None:
