@@ -50,6 +50,11 @@ dev = [
     "pycocotools",
     "numba",
     "python-rapidjson",
+    "pillow",
+    "mediapy",
+    "python-dotenv",
+    "pyyaml",
+    "requests",
 ]
 notebooks = [
     "matplotlib",
