@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
@@ -32,14 +33,10 @@ except ImportError:  # pragma: no cover - dependency guard
 from sam3.model_builder import build_sam3_video_model, build_sam3_video_predictor
 
 
-DEFAULT_DATASET_ROOT = Path(
-    "/hdd1/home/rick/OrcaHandWorldModel/datasets/2026-03-14T13-34-49/large_real_dataset_5fps_135_240_test"
-)
-DEFAULT_CALIBRATION_DIR = Path(
-    "assets/calibration_params_08_03_26"
-)
+DEFAULT_DATASET_ROOT = Path("datasets/converted_processed_OOD/2026-04-04T12-25-46/processed_OOD")
+DEFAULT_CALIBRATION_DIR = Path("/home/riccardo/sam3_based_labeling_pipeline/assets/calibration_params_08_03_26")
 DEFAULT_WRIST_PRIMING_VIDEO_PATH = Path(
-    "assets/initial_hand_motion/videos/6/1_rgb.mp4"
+    "/home/riccardo/sam3_based_labeling_pipeline/assets/initial_hand_motion/videos/6/1_rgb.mp4"
 )
 WRIST_VIEW_INDEX = 1
 THIRD_VIEW_INDEX = 0
@@ -54,6 +51,9 @@ VIEW_PROMPTS = {
     0: [
         {"obj_id": 0, "label_id": 1, "text": "the hand", "select_mask_based_on_highest_score": True},
         {"obj_id": 1, "label_id": 2, "text": "red dice"},
+        {"obj_id": 2, "label_id": 3, "text": "blue dice"},
+        {"obj_id": 3, "label_id": 4, "text": "yellow dice"},
+        {"obj_id": 4, "label_id": 5, "text": "yellow duck"}
     ],
     1: [
         {
@@ -63,13 +63,18 @@ VIEW_PROMPTS = {
             "use_priming_video": True,
         },
         {"obj_id": 1, "label_id": 2, "text": "red dice"},
+        {"obj_id": 2, "label_id": 3, "text": "blue dice"},
+        {"obj_id": 3, "label_id": 4, "text": "yellow dice"},
+        {"obj_id": 4, "label_id": 5, "text": "yellow duck"}
     ],
 }
 
 LABEL_COLORS_RGB = {
     1: (0, 255, 0),  # hand
     2: (255, 0, 0),  # object
-    3: (0, 0, 255),  # optional extra object
+    3: (0, 0, 255),  # object
+    4: (255, 255, 0),  # object
+    5: (255, 0, 255),  # object
 }
 
 VIDEO_INDEX_TO_CAMERA = {
@@ -115,6 +120,16 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=None,
         help="Episode ids and ranges, e.g. 1 3 5-10. Defaults to all.",
+    )
+    parser.add_argument(
+        "--rotate-view1-episode-ids",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional episode ids for which videos/<episode>/1_rgb.mp4 is rotated by 180 "
+            "degrees in-place before SAM3 processing. Supports ranges like '1-10'."
+        ),
     )
     parser.add_argument(
         "--view-mode",
@@ -1270,6 +1285,45 @@ def wait_for_vram(min_free_gb: float, poll_interval_s: float = 30.0) -> int:
         time.sleep(poll_interval_s)
 
 
+def rotate_video_180_inplace(video_path: Path, target_fps: float | None = None) -> None:
+    assert cv2 is not None
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video for rotation: {video_path}")
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    source_fps = float(cap.get(cv2.CAP_PROP_FPS))
+    fps = float(target_fps) if target_fps is not None and target_fps > 0 else source_fps
+    if fps <= 0:
+        fps = 30.0
+
+    temp_path = video_path.with_name(
+        f"{video_path.stem}.rot180.{uuid.uuid4().hex[:8]}{video_path.suffix}"
+    )
+    writer = cv2.VideoWriter(
+        str(temp_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (width, height),
+    )
+    if not writer.isOpened():
+        cap.release()
+        raise RuntimeError(f"Could not create temporary rotated video: {temp_path}")
+
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            writer.write(cv2.rotate(frame, cv2.ROTATE_180))
+    finally:
+        cap.release()
+        writer.release()
+
+    temp_path.replace(video_path)
+
+
 def main() -> None:
     args = parse_args()
     run_started_s = time.time()
@@ -1290,6 +1344,7 @@ def main() -> None:
         parsed = _parse_episode_id_tokens(args.episode_ids)
         episode_ids = sorted(parsed)
 
+    rotate_view1_episode_ids = _parse_episode_id_tokens(args.rotate_view1_episode_ids)
     selected_views = _selected_views(args.view_mode)
     calibration_map = load_calibration_map(args.calibration_dir)
 
@@ -1340,6 +1395,14 @@ def main() -> None:
                 if not input_video_path.exists():
                     print(f"[warning] Missing input video: {input_video_path}")
                     continue
+                if view_index == WRIST_VIEW_INDEX and (
+                    requested_episode_id in rotate_view1_episode_ids
+                    or episode_id in rotate_view1_episode_ids
+                ):
+                    print(
+                        f"[episode {episode_id}] rotating {input_video_path.name} by 180 degrees"
+                    )
+                    rotate_video_180_inplace(input_video_path, target_fps=args.output_fps)
 
                 output_video_path = episode_dir / f"{view_index}_segmentation.mp4"
                 output_mask_path = episode_dir / f"{view_index}_segmentation_mask.npy"
