@@ -1,0 +1,26 @@
+settings:
+  poll_interval_seconds: 10
+  allowed_gpus: [0, 1]
+
+jobs:
+  - name: "fast_preprocess"
+    command: "python scripts/preprocess.py"
+    order: 0
+    expected_minutes: 15
+    required_vram_gb: 4
+    max_cpu_percent: 90
+
+  - name: "main_extraction"
+    command: "python scripts/final_extract_segmentation_masks.py --gpus {gpus}"
+    order: 0
+    expected_minutes: 90
+    required_vram_gb: 16
+    max_cpu_percent: 90
+    parallel_on_multiple_gpus: true
+    num_gpus: 2
+
+  - name: "post_stage"
+    command: "python scripts/postprocess.py"
+    order: 1
+    expected_minutes: 10
+    required_vram_gb: 2
