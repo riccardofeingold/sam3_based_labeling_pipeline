@@ -32,10 +32,14 @@ except ImportError:  # pragma: no cover - dependency guard
 from sam3.model_builder import build_sam3_video_model, build_sam3_video_predictor
 
 
-DEFAULT_DATASET_ROOT = Path("/data/Ctrl-World/datasets/large_real_dataset")
-DEFAULT_CALIBRATION_DIR = Path("/data/sam3_based_labeling_pipeline/assets/calibration_params")
+DEFAULT_DATASET_ROOT = Path(
+    "/hdd1/home/rick/OrcaHandWorldModel/datasets/2026-03-14T13-34-49/large_real_dataset_5fps_135_240_test"
+)
+DEFAULT_CALIBRATION_DIR = Path(
+    "assets/calibration_params_08_03_26"
+)
 DEFAULT_WRIST_PRIMING_VIDEO_PATH = Path(
-    "/data/Ctrl-World/datasets/initial_hand_motion/videos/6/1_rgb.mp4"
+    "assets/initial_hand_motion/videos/6/1_rgb.mp4"
 )
 WRIST_VIEW_INDEX = 1
 THIRD_VIEW_INDEX = 0
@@ -173,6 +177,22 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional mention prefix in Discord message, e.g. '@here' or '<@123>'.",
     )
+    parser.add_argument(
+        "--min-free-vram-gb",
+        type=float,
+        default=20,
+        help=(
+            "Minimum free VRAM (in GB) required on at least one GPU before loading models. "
+            "Script will poll all GPUs and wait until the condition is met. "
+            "If not set, no VRAM check is performed."
+        ),
+    )
+    parser.add_argument(
+        "--vram-poll-interval",
+        type=float,
+        default=30.0,
+        help="Seconds between VRAM availability checks (default: 30).",
+    )
     return parser.parse_args()
 
 
@@ -287,6 +307,14 @@ def _iter_chunk_bounds(total_frames: int, chunk_max_frames: int) -> List[Tuple[i
         out.append((start, end))
         start = end
     return out
+
+
+def _discord(webhook_url: str | None, mention: str, content: str) -> None:
+    """Send *content* to Discord if *webhook_url* is set, prefixing with *mention*."""
+    if not webhook_url:
+        return
+    prefix = f"{mention.strip()} " if mention.strip() else ""
+    _send_discord_message(webhook_url, f"{prefix}{content}")
 
 
 def _send_discord_message(webhook_url: str, content: str) -> None:
@@ -1205,6 +1233,43 @@ def process_video(
     print(f"[done] frames={target_frame_count} labels={np.unique(label_maps).tolist()}")
 
 
+def _free_vram_per_gpu_gb() -> List[Tuple[int, float]]:
+    """Return [(gpu_index, free_gb), ...] for every visible CUDA device."""
+    result = []
+    n = torch.cuda.device_count()
+    for i in range(n):
+        free_bytes, _ = torch.cuda.mem_get_info(i)
+        result.append((i, free_bytes / 1024 ** 3))
+    return result
+
+
+def wait_for_vram(min_free_gb: float, poll_interval_s: float = 30.0) -> int:
+    """Block until at least one GPU has >= *min_free_gb* GB of free VRAM.
+
+    Returns the index of the GPU that satisfied the requirement.
+    """
+    if not torch.cuda.is_available():
+        raise RuntimeError("No CUDA devices found; cannot check VRAM.")
+
+    while True:
+        gpu_stats = _free_vram_per_gpu_gb()
+        status = "  ".join(f"gpu{i}: {gb:.1f} GB free" for i, gb in gpu_stats)
+        best_idx, best_free = max(gpu_stats, key=lambda x: x[1])
+        print(f"[vram-check] {status}")
+        if best_free >= min_free_gb:
+            print(
+                f"[vram-check] gpu{best_idx} has {best_free:.1f} GB free "
+                f"(>= {min_free_gb} GB required). Proceeding."
+            )
+            return best_idx
+        print(
+            f"[vram-check] Not enough free VRAM (need {min_free_gb} GB, "
+            f"best is {best_free:.1f} GB on gpu{best_idx}). "
+            f"Retrying in {poll_interval_s:.0f}s..."
+        )
+        time.sleep(poll_interval_s)
+
+
 def main() -> None:
     args = parse_args()
     run_started_s = time.time()
@@ -1228,10 +1293,24 @@ def main() -> None:
     selected_views = _selected_views(args.view_mode)
     calibration_map = load_calibration_map(args.calibration_dir)
 
+    if args.min_free_vram_gb is not None:
+        wait_for_vram(
+            min_free_gb=args.min_free_vram_gb,
+            poll_interval_s=args.vram_poll_interval,
+        )
+
     sam3_model = build_sam3_video_model()
     box_predictor = sam3_model.tracker
     box_predictor.backbone = sam3_model.detector.backbone
     text_predictor = build_sam3_video_predictor()
+
+    _discord(
+        args.discord_webhook_url,
+        args.discord_mention,
+        f"final_extract_segmentation_masks.py STARTED | "
+        f"dataset={dataset_root.name} | episodes={len(episode_ids)} | "
+        f"views={args.view_mode}",
+    )
 
     try:
         for requested_episode_id in episode_ids:
@@ -1275,6 +1354,13 @@ def main() -> None:
                     f"[episode {episode_id}] processing view={view_index} "
                     f"video={input_video_path.name}"
                 )
+                _discord(
+                    args.discord_webhook_url,
+                    args.discord_mention,
+                    f"[{processed_videos + 1}/{len(episode_ids) * len(selected_views)}] "
+                    f"processing episode={episode_id} view={view_index} "
+                    f"({input_video_path.name})",
+                )
                 process_video(
                     text_predictor=text_predictor,
                     box_predictor=box_predictor,
@@ -1311,16 +1397,14 @@ def main() -> None:
         raise
     finally:
         text_predictor.shutdown()
-        if args.discord_webhook_url:
-            elapsed_s = int(time.time() - run_started_s)
-            status_text = "FAILED" if run_failed else "DONE"
-            mention = args.discord_mention.strip()
-            prefix = f"{mention} " if mention else ""
-            msg = (
-                f"{prefix}final_extract_segmentation_masks.py {status_text} | "
-                f"processed_videos={processed_videos} | elapsed_s={elapsed_s}"
-            )
-            _send_discord_message(args.discord_webhook_url, msg)
+        elapsed_s = int(time.time() - run_started_s)
+        status_text = "FAILED" if run_failed else "DONE"
+        _discord(
+            args.discord_webhook_url,
+            args.discord_mention,
+            f"final_extract_segmentation_masks.py {status_text} | "
+            f"processed_videos={processed_videos} | elapsed={elapsed_s}s",
+        )
 
 
 if __name__ == "__main__":
