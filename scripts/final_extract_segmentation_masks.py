@@ -19,7 +19,7 @@ import torch
 from PIL import Image
 
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(override=True)
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 if not DISCORD_WEBHOOK_URL:
@@ -337,7 +337,10 @@ def _send_discord_message(webhook_url: str, content: str) -> None:
     req = urllib_request.Request(
         webhook_url,
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "curl/8.5.0",
+        },
         method="POST",
     )
     try:

@@ -29,15 +29,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import paramiko
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 # ---------------------------------------------------------------------------
 # Edit this dict to add / remove servers.
 # Keys are display names used in the Discord message.
 # ---------------------------------------------------------------------------
 SERVERS: dict[str, dict] = {
-    # "gpu1": {"host": "192.168.1.10", "user": "riccardo", "port": 22},
-    # "gpu2": {"host": "192.168.1.11", "user": "riccardo", "port": 22},
+    "gpu1": {"host": "srl-dsk-004", "user": "rick", "port": 22},
+    "gpu2": {"host": "srl-dsk-015", "user": "riccardo", "port": 22},
 }
 
 NVIDIA_SMI_CMD = (
@@ -151,7 +151,10 @@ def _send_discord_message(webhook_url: str, content: str) -> None:
     req = urllib_request.Request(
         webhook_url,
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "curl/8.5.0",
+        },
         method="POST",
     )
     try:
