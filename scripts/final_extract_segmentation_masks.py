@@ -47,9 +47,16 @@ THIRD_VIEW_INDEX = 0
 # - box: run with build_sam3_video_model().tracker
 # - box_from_projection: derive box from calibration and axis-aligned ROI
 # - use_priming_video: prepend reversed priming video to each chunk
+# - reprompt_every: for text prompts, re-add prompt every N frames
 VIEW_PROMPTS = {
     0: [
-        {"obj_id": 0, "label_id": 1, "text": "the hand", "select_mask_based_on_highest_score": True},
+        {
+            "obj_id": 0,
+            "label_id": 1,
+            "text": "the hand",
+            "select_mask_based_on_highest_score": True,
+            "reprompt_every": 90,
+        },
         {"obj_id": 1, "label_id": 2, "text": "red dice"},
         {"obj_id": 2, "label_id": 3, "text": "blue dice"},
         {"obj_id": 3, "label_id": 4, "text": "yellow dice"},
@@ -65,7 +72,7 @@ VIEW_PROMPTS = {
         {"obj_id": 1, "label_id": 2, "text": "red dice"},
         {"obj_id": 2, "label_id": 3, "text": "blue dice"},
         {"obj_id": 3, "label_id": 4, "text": "yellow dice"},
-        {"obj_id": 4, "label_id": 5, "text": "yellow duck"}
+        {"obj_id": 4, "label_id": 5, "text": "duck"}
     ],
 }
 
@@ -806,6 +813,7 @@ def _run_text_prompt(
     prompt_text: str,
     mask_label_id: int,
     projected_points_by_frame: Dict[int, Tuple[int, int]] | None = None,
+    reprompt_every: int | None = None,
 ) -> Dict[int, Dict[int, np.ndarray]]:
     preprocessed_dir = Path(tempfile.mkdtemp(prefix="sam3_preprocessed_frames_"))
     for idx, frame_rgb in enumerate(chunk_frames):
@@ -818,55 +826,60 @@ def _run_text_prompt(
 
     outputs_per_frame: Dict[int, Dict[int, np.ndarray]] = {}
     try:
-        _ = text_predictor.handle_request(
-            request=dict(type="reset_session", session_id=session_id)
-        )
-        _ = text_predictor.handle_request(
-            request=dict(
-                type="add_prompt",
-                session_id=session_id,
-                frame_index=0,
-                obj_id=prompt_obj_id,
-                text=prompt_text,
+        interval = int(reprompt_every) if reprompt_every is not None else 0
+        if interval <= 0:
+            interval = len(chunk_frames)
+        for window_start in range(0, len(chunk_frames), interval):
+            window_len = min(interval, len(chunk_frames) - window_start)
+            _ = text_predictor.handle_request(
+                request=dict(type="reset_session", session_id=session_id)
             )
-        )
-        for stream_response in text_predictor.handle_stream_request(
-            request=dict(
-                type="propagate_in_video",
-                session_id=session_id,
-                propagation_direction="forward",
-                start_frame_index=0,
-                max_frame_num_to_track=len(chunk_frames),
+            _ = text_predictor.handle_request(
+                request=dict(
+                    type="add_prompt",
+                    session_id=session_id,
+                    frame_index=window_start,
+                    obj_id=prompt_obj_id,
+                    text=prompt_text,
+                )
             )
-        ):
-            frame_idx = int(stream_response["frame_index"])
-            out = stream_response["outputs"]
-            scores = np.asarray(out["out_probs"], dtype=np.float32)
-            masks = np.asarray(out["out_binary_masks"])
-            if len(scores) == 0 or len(masks) == 0:
-                continue
-            best_idx = int(np.argmax(scores))
-            if projected_points_by_frame is not None:
-                point_xy = projected_points_by_frame.get(frame_idx)
-                if point_xy is not None:
-                    px, py = int(point_xy[0]), int(point_xy[1])
-                    candidate_indices: List[int] = []
-                    for idx in range(len(masks)):
-                        mask_arr = np.asarray(masks[idx])
-                        while mask_arr.ndim > 2:
-                            mask_arr = mask_arr[0]
-                        if mask_arr.ndim != 2:
-                            continue
-                        h, w = mask_arr.shape[:2]
-                        if px < 0 or py < 0 or px >= w or py >= h:
-                            continue
-                        if bool(mask_arr[py, px]):
-                            candidate_indices.append(idx)
-                    if candidate_indices:
-                        candidate_scores = scores[np.asarray(candidate_indices, dtype=np.int64)]
-                        best_idx = int(candidate_indices[int(np.argmax(candidate_scores))])
-            frame_store = outputs_per_frame.setdefault(frame_idx, {})
-            frame_store[mask_label_id] = np.asarray(masks[best_idx])
+            for stream_response in text_predictor.handle_stream_request(
+                request=dict(
+                    type="propagate_in_video",
+                    session_id=session_id,
+                    propagation_direction="forward",
+                    start_frame_index=window_start,
+                    max_frame_num_to_track=window_len,
+                )
+            ):
+                frame_idx = int(stream_response["frame_index"])
+                out = stream_response["outputs"]
+                scores = np.asarray(out["out_probs"], dtype=np.float32)
+                masks = np.asarray(out["out_binary_masks"])
+                if len(scores) == 0 or len(masks) == 0:
+                    continue
+                best_idx = int(np.argmax(scores))
+                if projected_points_by_frame is not None:
+                    point_xy = projected_points_by_frame.get(frame_idx)
+                    if point_xy is not None:
+                        px, py = int(point_xy[0]), int(point_xy[1])
+                        candidate_indices: List[int] = []
+                        for idx in range(len(masks)):
+                            mask_arr = np.asarray(masks[idx])
+                            while mask_arr.ndim > 2:
+                                mask_arr = mask_arr[0]
+                            if mask_arr.ndim != 2:
+                                continue
+                            h, w = mask_arr.shape[:2]
+                            if px < 0 or py < 0 or px >= w or py >= h:
+                                continue
+                            if bool(mask_arr[py, px]):
+                                candidate_indices.append(idx)
+                        if candidate_indices:
+                            candidate_scores = scores[np.asarray(candidate_indices, dtype=np.int64)]
+                            best_idx = int(candidate_indices[int(np.argmax(candidate_scores))])
+                frame_store = outputs_per_frame.setdefault(frame_idx, {})
+                frame_store[mask_label_id] = np.asarray(masks[best_idx])
     finally:
         try:
             _ = text_predictor.handle_request(
@@ -1077,6 +1090,11 @@ def process_video(
             prompt_outputs: Dict[int, Dict[int, np.ndarray]]
             if use_text:
                 prompt_text = str(prompt_spec["text"])
+                reprompt_every = (
+                    int(prompt_spec["reprompt_every"])
+                    if "reprompt_every" in prompt_spec
+                    else None
+                )
                 # For text prompts, always anchor from the first frame of the full video,
                 # then track into this chunk's frames.
                 chunk_frames = [global_first_target_frame, *prompt_priming, *chunk_target_frames]
@@ -1132,6 +1150,7 @@ def process_video(
                     prompt_text=prompt_text,
                     mask_label_id=mask_label_id,
                     projected_points_by_frame=projected_points_by_frame,
+                    reprompt_every=reprompt_every,
                 )
             else:
                 box_xyxy: Sequence[float]
