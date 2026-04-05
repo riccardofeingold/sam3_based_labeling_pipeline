@@ -54,8 +54,8 @@ VIEW_PROMPTS = {
             "obj_id": 0,
             "label_id": 1,
             "text": "the hand",
-            "select_mask_based_on_highest_score": True,
-            "reprompt_every": 90,
+            "select_mask_based_on_projected_ee": True,
+            "reprompt_every": 100,
         },
         {"obj_id": 1, "label_id": 2, "text": "red dice"},
         {"obj_id": 2, "label_id": 3, "text": "blue dice"},
@@ -171,6 +171,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--roi-pos-primary-m", type=float, default=0.12)
     parser.add_argument("--roi-neg-secondary-m", type=float, default=0.12)
     parser.add_argument("--roi-pos-secondary-m", type=float, default=0.12)
+    parser.add_argument(
+        "--reprompt-min-border-px",
+        type=int,
+        default=0,
+        help=(
+            "Minimum distance (in pixels) that the projected EE point must be from "
+            "any frame border to trigger a reprompt. 0 disables the check (always reprompt)."
+        ),
+    )
     parser.add_argument(
         "--morph-close-radius",
         type=int,
@@ -814,6 +823,7 @@ def _run_text_prompt(
     mask_label_id: int,
     projected_points_by_frame: Dict[int, Tuple[int, int]] | None = None,
     reprompt_every: int | None = None,
+    reprompt_min_border_px: int = 0,
 ) -> Dict[int, Dict[int, np.ndarray]]:
     preprocessed_dir = Path(tempfile.mkdtemp(prefix="sam3_preprocessed_frames_"))
     for idx, frame_rgb in enumerate(chunk_frames):
@@ -825,24 +835,43 @@ def _run_text_prompt(
     session_id = start_response["session_id"]
 
     outputs_per_frame: Dict[int, Dict[int, np.ndarray]] = {}
+    frame_h, frame_w = chunk_frames[0].shape[:2]
     try:
         interval = int(reprompt_every) if reprompt_every is not None else 0
         if interval <= 0:
             interval = len(chunk_frames)
         for window_start in range(0, len(chunk_frames), interval):
             window_len = min(interval, len(chunk_frames) - window_start)
-            _ = text_predictor.handle_request(
-                request=dict(type="reset_session", session_id=session_id)
-            )
-            _ = text_predictor.handle_request(
-                request=dict(
-                    type="add_prompt",
-                    session_id=session_id,
-                    frame_index=window_start,
-                    obj_id=prompt_obj_id,
-                    text=prompt_text,
+            # Decide whether to reprompt at this window boundary.
+            # The first window always gets a prompt. Subsequent windows are
+            # skipped when the projected EE point is closer than
+            # reprompt_min_border_px pixels to any frame border (or absent).
+            is_first_window = window_start == 0
+            do_reprompt = is_first_window
+            if not do_reprompt:
+                if projected_points_by_frame is None or reprompt_min_border_px <= 0:
+                    do_reprompt = True
+                else:
+                    point_xy = projected_points_by_frame.get(window_start)
+                    if point_xy is not None:
+                        px, py = int(point_xy[0]), int(point_xy[1])
+                        b = reprompt_min_border_px
+                        do_reprompt = (
+                            b <= px < frame_w - b and b <= py < frame_h - b
+                        )
+            if do_reprompt:
+                _ = text_predictor.handle_request(
+                    request=dict(type="reset_session", session_id=session_id)
                 )
-            )
+                _ = text_predictor.handle_request(
+                    request=dict(
+                        type="add_prompt",
+                        session_id=session_id,
+                        frame_index=window_start,
+                        obj_id=prompt_obj_id,
+                        text=prompt_text,
+                    )
+                )
             for stream_response in text_predictor.handle_stream_request(
                 request=dict(
                     type="propagate_in_video",
@@ -878,6 +907,21 @@ def _run_text_prompt(
                         if candidate_indices:
                             candidate_scores = scores[np.asarray(candidate_indices, dtype=np.int64)]
                             best_idx = int(candidate_indices[int(np.argmax(candidate_scores))])
+                        else:
+                            # Fallback: no mask contains the projected EE point directly,
+                            # so pick the mask whose centroid is closest to it.
+                            dists: List[float] = []
+                            for idx in range(len(masks)):
+                                mask_arr = np.asarray(masks[idx])
+                                while mask_arr.ndim > 2:
+                                    mask_arr = mask_arr[0]
+                                ys, xs = np.where(mask_arr)
+                                if len(xs) == 0:
+                                    dists.append(float("inf"))
+                                else:
+                                    cx, cy = float(xs.mean()), float(ys.mean())
+                                    dists.append((cx - px) ** 2 + (cy - py) ** 2)
+                            best_idx = int(np.argmin(np.asarray(dists, dtype=np.float64)))
                 frame_store = outputs_per_frame.setdefault(frame_idx, {})
                 frame_store[mask_label_id] = np.asarray(masks[best_idx])
     finally:
@@ -988,6 +1032,7 @@ def process_video(
     chunk_max_frames: int,
     morph_close_radius: int,
     apply_morph_close: bool,
+    reprompt_min_border_px: int = 0,
 ) -> None:
     target_video_np = media.read_video(str(video_path))
     if target_video_np is None or len(target_video_np) == 0:
@@ -1078,7 +1123,7 @@ def process_video(
         for prompt_spec in prompts:
             prompt_obj_id = int(prompt_spec["obj_id"])
             mask_label_id = int(prompt_spec.get("label_id", prompt_obj_id))
-            select_mask_based_on_highest_score = bool(prompt_spec.get("select_mask_based_on_highest_score", False))
+            select_mask_based_on_projected_ee = bool(prompt_spec.get("select_mask_based_on_projected_ee", False))
             use_text = "text" in prompt_spec
             use_projection = bool(prompt_spec.get("box_from_projection", False))
             use_explicit_box = "box" in prompt_spec
@@ -1101,7 +1146,7 @@ def process_video(
                 frame_index_offset = 1 + len(prompt_priming)
                 projected_points_by_frame: Dict[int, Tuple[int, int]] | None = None
                 if (
-                    select_mask_based_on_highest_score 
+                    select_mask_based_on_projected_ee 
                     and "hand" in prompt_text.lower()
                     and calib is not None
                     and camera_mode is not None
@@ -1151,6 +1196,7 @@ def process_video(
                     mask_label_id=mask_label_id,
                     projected_points_by_frame=projected_points_by_frame,
                     reprompt_every=reprompt_every,
+                    reprompt_min_border_px=reprompt_min_border_px,
                 )
             else:
                 box_xyxy: Sequence[float]
@@ -1475,6 +1521,7 @@ def main() -> None:
                         view_index=view_index,
                         morph_close_views=args.morph_close_views,
                     ),
+                    reprompt_min_border_px=args.reprompt_min_border_px,
                 )
                 processed_videos += 1
     except Exception:
