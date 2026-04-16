@@ -1,5 +1,82 @@
 # SAM 3: Segment Anything with Concepts
 
+## Segmentation Mask Extraction Script
+
+[`scripts/final_extract_segmentation_masks.py`](scripts/final_extract_segmentation_masks.py) runs SAM 3 over a multi-episode robot dataset and writes per-frame segmentation masks and visualisation videos.
+
+### Dataset layout expected
+
+```
+<dataset-root>/
+  annotation/          # one JSON per episode, named <episode_id>.json
+  videos/
+    <episode_id>/
+      0_rgb.mp4        # side / third view
+      1_rgb.mp4        # wrist view
+```
+
+Each annotation JSON must contain:
+- `episode_id`
+- `observation.state.cartesian_position`
+- `observation.state.cartesian_orientation_quat`
+
+### Outputs
+
+For every processed episode/view the script writes:
+
+| File | Description |
+|---|---|
+| `videos/<episode_id>/<view>_segmentation.mp4` | Colour-coded segmentation video |
+| `videos/<episode_id>/<view>_segmentation_mask.npy` | `uint8` label map array, shape `(T, H, W)` |
+
+Label IDs follow `LABEL_COLORS_RGB` in the script (1 = hand, 2–5 = objects).
+
+### Basic usage
+
+```bash
+# Process all episodes, both views
+python scripts/final_extract_segmentation_masks.py \
+  --dataset-root datasets/my_dataset
+
+# Process specific episodes and only the wrist view
+python scripts/final_extract_segmentation_masks.py \
+  --dataset-root datasets/my_dataset \
+  --episode-ids 1 3 5-10 \
+  --view-mode wrist
+
+# Rotate wrist video 180° for specific episodes before processing
+python scripts/final_extract_segmentation_masks.py \
+  --dataset-root datasets/my_dataset \
+  --rotate-view1-episode-ids 4 7-9
+```
+
+### Key arguments
+
+| Argument | Default | Description |
+|---|---|---|
+| `--dataset-root` | see script | Root directory of the dataset |
+| `--episode-ids` | all | Episodes to process; supports ranges e.g. `1 3 5-10` |
+| `--rotate-view1-episode-ids` | none | Rotate `1_rgb.mp4` 180° in-place for these episodes |
+| `--view-mode` | `both` | `wrist`, `third`, or `both` |
+| `--chunk-max-frames` | `1000` | Max frames per SAM 3 inference chunk; `<=0` disables chunking |
+| `--output-fps` | `5.0` | FPS of the output segmentation video |
+| `--downscaled-long-side-px` | none | Resize long side to this value before inference |
+| `--calibration-dir` | see script | Directory with `camera_intrinsics.pkl` and `transformations.pkl` |
+| `--wrist-priming-video-path` | see script | Reversed priming clip prepended to wrist-view chunks |
+| `--morph-close-radius` | `3` | Morphological closing radius on masks; `<=0` disables |
+| `--morph-close-views` | `wrist` | Which views receive morphological closing: `wrist`, `third`, `both`, `none` |
+| `--reprompt-min-border-px` | `0` | Skip reprompt when projected EE point is within this many px of any border |
+| `--min-free-vram-gb` | `20` | Minimum free VRAM (GB) required before loading models; polls until available |
+| `--vram-poll-interval` | `30` | Seconds between VRAM checks |
+| `--discord-webhook-url` | `$DISCORD_WEBHOOK_URL` | Discord webhook for start/progress/done notifications |
+| `--discord-mention` | `""` | Optional mention prefix, e.g. `@here` |
+
+### Environment variables
+
+The script loads a `.env` file via `python-dotenv`. `DISCORD_WEBHOOK_URL` must be set either in `.env` or in the environment.
+
+---
+
 Meta Superintelligence Labs
 
 [Nicolas Carion](https://www.nicolascarion.com/)\*,
